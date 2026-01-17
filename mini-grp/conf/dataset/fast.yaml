@@ -1,6 +1,6 @@
 to_name: gberseth/bridge-data-64px-full # https://huggingface.co/datasets/gberseth/libero-data-64px-full
-num_episodes: 20
-chunk_size: 5
+num_episodes: 1
+chunk_size: 1
 buffer_size: 50000
 encode_with_t5: false
 t5_version: "t5-small"

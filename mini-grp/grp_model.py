@@ -8,7 +8,7 @@ def get_patches_fast(images, cfg):
     from einops import rearrange
     batch_size, height, width, channels = images.shape
     patch_size = cfg.patch_size ## n_patches = 8
-    # TODO: Make changes to support larger images
+
     patches = rearrange(images[:,:,:,:3], 'b (h p1) (w p2) c -> b (h w) (p1 p2 c)', p1 = patch_size, p2 = patch_size)
     if channels > 3:
         ## History stacking in the channel dimension for observations only, not goal images.
@@ -188,6 +188,7 @@ class GRP(nn.Module):
                 raise ValueError("tokenizer and text_model must be provided when using T5 encoding")
             # TODO:    
             ## Provide the logic converting text goal to T5 embedding tensor
+            pass
         else:
             pad = " " * self._cfg.max_block_size
             goal_ = goal[:self._cfg.max_block_size] + pad[len(goal):self._cfg.max_block_size]

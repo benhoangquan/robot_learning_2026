@@ -212,10 +212,8 @@ class CircularBuffer:
         from torchvision.transforms import v2 # Recommend v2 for new code
         from einops import rearrange
         if self._cfg.policy.use_image_augmentations:
-            # TODO: 
-            ## Provide the logic for the GRP network
-
-            Add image Augmentations to improv performance
+            # TODO:
+            ## Add image Augmentations to improve performance
         else:
             transform_crop_scale = v2.Compose([
                 v2.ToDtype(torch.float32) # Convert to float [0,1] after crop/resize
@@ -239,15 +237,9 @@ class CircularBuffer:
             x_goal = data["goal"][ix]
         x_goal_img = self._model.normalize_state(transform_crop_scale(data["goal_img"][ix].permute(0,3,1,2).to(torch.float))) ## [B, C, H,  W]
         x_goal_img = x_goal_img.permute(0, 2, 3, 1) # Convert to [B, H, W, C] format from torchvision.
-        """
-        [DEFAULT]
         # TODO: 
         ## Provide the block masking logic for the attention head
         y = 0 ## discrete or continuous actions
-        [/DEFAULT]
-        """
-        y = self._model.encode_action(data["action"][ix + cfg.policy.obs_stacking - 1])
-        # [/TODO]
         if cfg.policy.action_stacking > 1:
             ## Stack the next cfg.policy.action_stacking actions together
             for i in range(1, cfg.policy.action_stacking): ## This is slow but works.
