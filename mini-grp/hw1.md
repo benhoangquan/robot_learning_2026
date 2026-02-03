@@ -24,10 +24,6 @@ In this section, the goal is to compare training results when using two differen
 
 The text tokenization and encoding provided in the initial version of the code are very basic. However, improving the tokenization to use pretrained language embedding tokens may improve goal-text generalization. To this end, use the tokenizer from the [T5 model](https://jmlr.org/papers/v21/20-074.html) to tokenize the text used to encode the goal descriptions. Some example code to get started is available [here](https://huggingface.co/docs/transformers/en/model_doc/t5).
 
-## Grow the Dataset [2pts]
-
-The dataset used for training is relatively small (100 trajectories) but works and fits on small GPUs. Use the [mini_shuffel_buffer.py](mini_shuffel_buffer.py) file to collect more data (250 trajectories instead of 100) and retrain the model. Does performance increase? Share the learning curves.
-
 ## State History [2pts]
 
 For most robotics problems, a single image is not enough to determine the dynamics well enough to predict the next state. This lack of dynamics information means the model can only solve certain tasks to a limited extent. To provide the model with sufficient state information, update the GRP input to include two images from the state history and evaluate the performance of this new model. Remark on the change in performance.
@@ -35,6 +31,11 @@ For most robotics problems, a single image is not enough to determine the dynami
 ## Action Chunking [2pts]
 
 One of the many methods used to smooth motion and compensate for multi-modal behaviour in the dataset is to predict many actions at a time. Train two new models that each have chunk size of 4 and 8. Provide plots and remark on the performance of using different chunk sizes.
+
+## Real Hardware Evaluation [2pts]
+
+The last step of training a robotics policy if to test it on real hardware. This is the only relaible option to evalaute performance. Run you policy on the real hardware and record a video of the behaviour to include in your submission. See the [documentation](https://docs.google.com/document/d/1CdADPr5R9lAAyaZEJ6uYGImnCk5vshCwAWYD9ofBV24/edit?usp=sharing) for details on how to run your policy on the hardware.
+
 
 ## Tips:
 
