@@ -55,8 +55,15 @@ class CEMPlanner(Planner):
         """
         # TODO: Part 1.3 - Initialize CEM planner
         ## Set up world model reference and determine if using DreamerV3 or SimpleWorldModel
-        pass
-        
+        super().__init__(cfg)
+        self.world_model = world_model
+        self.action_dim = action_dim
+        self.cfg = cfg
+        self.horizon = cfg.planner.horizon
+        self.num_samples = cfg.planner.num_samples
+        self.num_elites = cfg.planner.num_elites
+        self.num_iterations = cfg.planner.num_iterations
+
     def plan(self, initial_state, return_best_sequence=True):
         """
         Plan action sequences using CEM to maximize predicted rewards.
@@ -73,8 +80,52 @@ class CEMPlanner(Planner):
         """
         # TODO: Part 1.3 - Implement CEM planning algorithm
         ## Sample action sequences, evaluate with world model, select elites, update distribution
-        pass
-    
+
+        # Random actions samples and scale to normalize to -1, 1
+        # variable name with s with more than 1 samples
+
+
+        # TODO if state/pose dim = (B, T, pose_dim)
+        if isinstance(self.world_model, SimpleWorldModel):
+
+            pose = initial_state["pose"]
+            device = pose.device
+            
+            mean_actions = torch.zeros(self.horizon, self.action_dim, device=device)
+            std_actions = torch.ones(self.horizon, self.action_dim, device=device)
+
+            for iteration in range(self.num_iterations):
+                # distribution sampling
+                actions = [torch.normal(mean_actions, std_actions, device=device) for _ in range(self.num_samples)]
+                actions = torch.stack(actions)
+                
+                # Vectorized Sampling
+                # N = num_samples, H = horizon, A = action_dim
+                # mean = mean_actions.unsqueeze(0).expand(self.num_samples, -1, -1)  # (N, H, A)
+                # std  = std_actions.unsqueeze(0).expand(self.num_samples, -1, -1)   # (N, H, A)
+                # actions = torch.normal(mean, std)  # (N, H, A)
+                
+                # Normalized actions
+                actions = actions.clamp(-1.0, 1.0)
+                
+                # eval seqs
+                rewards = self._evaluate_sequences(initial_state, actions)
+
+                # update mean/std from the elites
+                # choose n actions sequences that have the highest rewards (arg max?) then calculate mean/std from that
+                _, idx = torch.topk(rewards, k=self.num_elites)
+                best_id = torch.argmax(rewards)
+                elites = actions[idx]
+                mean_actions = elites.mean(dim=0)
+                std_actions = elites.std(dim=0) + 1e-6
+
+            # return top action/action mean and top reward/reward mean
+            if return_best_sequence: 
+                return actions[best_id], rewards[best_id].item()
+            else: 
+                return mean_actions, rewards.mean()
+
+ 
     def _evaluate_sequences(self, initial_state, action_sequences):
         """
         Evaluate a batch of action sequences by rolling them out in the world model.
@@ -88,6 +139,8 @@ class CEMPlanner(Planner):
         """
         # TODO: Part 1.3 - Route to appropriate evaluation method
         ## Determine if using DreamerV3 or SimpleWorldModel and call appropriate method
+        if type(self.world_model).__name__ == "DreamerV3": 
+            
         pass
     
     def _evaluate_sequences_dreamer(self, initial_state, action_sequences):
