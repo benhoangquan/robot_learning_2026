@@ -63,6 +63,7 @@ class CEMPlanner(Planner):
         self.num_elites = cfg.planner.num_elites
         self.num_iterations = cfg.planner.num_iterations
 
+    @torch.no_grad()
     def plan(self, initial_state, return_best_sequence=True):
         """
         Plan action sequences using CEM to maximize predicted rewards.
@@ -94,15 +95,15 @@ class CEMPlanner(Planner):
             std_actions = torch.ones(self.horizon, self.action_dim, device=device)
 
             for iteration in range(self.num_iterations):
-                # distribution sampling
-                actions = [torch.normal(mean_actions, std_actions, device=device) for _ in range(self.num_samples)]
-                actions = torch.stack(actions)
+                # # distribution sampling slow!
+                # actions = [torch.normal(mean_actions, std_actions, device=device) for _ in range(self.num_samples)]
+                # actions = torch.stack(actions)
                 
                 # Vectorized Sampling
                 # N = num_samples, H = horizon, A = action_dim
-                # mean = mean_actions.unsqueeze(0).expand(self.num_samples, -1, -1)  # (N, H, A)
-                # std  = std_actions.unsqueeze(0).expand(self.num_samples, -1, -1)   # (N, H, A)
-                # actions = torch.normal(mean, std)  # (N, H, A)
+                mean = mean_actions.unsqueeze(0).expand(self.num_samples, -1, -1)  # (N, H, A)
+                std  = std_actions.unsqueeze(0).expand(self.num_samples, -1, -1)   # (N, H, A)
+                actions = torch.normal(mean, std)  # (N, H, A)
                 
                 # Normalized actions
                 actions = actions.clamp(-1.0, 1.0)

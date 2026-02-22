@@ -340,44 +340,67 @@ def my_main(cfg: DictConfig):
         total_iters=cfg.max_iters     # Decay over num_epochs
     )
     policy_loss = 0
+    
+        # Helper to slice sequences to the correct length T
+    def collate_fn(batch):
+        T = cfg.policy.sequence_length
+        # Pre-allocate lists
+        images, actions, rewards, dones, poses = [], [], [], [], []
+        
+        for item in batch:
+            # item is (image, action, reward, done, pose)
+            # Take only the first T steps (or implement random window sampling here)
+            images.append(item[0][:T])
+            actions.append(item[1][:T])
+            rewards.append(item[2][:T])
+            dones.append(item[3][:T])
+            poses.append(item[4][:T])
+            
+        return {
+            'images': torch.stack(images),
+            'actions': torch.stack(actions),
+            'rewards': torch.stack(rewards),
+            'dones': torch.stack(dones),
+            'poses': torch.stack(poses)
+        }
+
+    # Initialize DataLoader for efficient loading
+    train_loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=4,        # Parallel data loading (cpu-side)
+        collate_fn=collate_fn,
+        pin_memory=True,      # Faster transfer to GPU
+        drop_last=True        # Drop incomplete batches
+    )
+    
 
     # Training loop
     for epoch in range(cfg.max_iters):
-        
-        num_idx = np.arange(len(dataset))
-        np.random.shuffle(num_idx)
-        loss = 0.0
+        loss_sum = 0.0
         batch_counter = 0
         
-        # Process data in batches
-        for batch_start in range(0, len(num_idx), batch_size):
-            batch_end = min(batch_start + batch_size, len(num_idx))
-            batch_indices = num_idx[batch_start:batch_end]
-            # Collect sequences for the batch
-            # TODO:    
-            ## Implement data loading and training step for the batch
+        # Use the efficient DataLoader
+        for batch in train_loader:
             
-            # Get trajectory
-            batch_images, batch_actions, batch_rewards, batch_dones, batch_poses = [], [], [], [], []
-            for idx in batch_indices:
-                image, action, reward, done, pose = dataset[idx]
-                T = cfg.policy.sequence_length
-                image, action = image[:T], action[:T]
-                reward, done, pose = reward[:T], done[:T], pose[:T]
-                batch_images.append(image)
-                batch_actions.append(action)
-                batch_rewards.append(reward)
-                batch_dones.append(done)
-                batch_poses.append(pose)
-                
-            # Stack into batch and move to deivce
-            images = torch.stack(batch_images, dim=0).to(device)
-            actions = torch.stack(batch_actions, dim=0).to(device)
-            rewards = torch.stack(batch_rewards, dim=0).to(device)
+            # CRITICAL OPTIMIZATION: 
+            # Only move images to GPU if the model actually needs them (Dreamer).
+            # SimpleWorldModel only uses poses, so moving images wastes massive VRAM.
+            if model_type == 'simple':
+                images = None
+            else:
+                images = batch['images'].to(device, non_blocking=True)
+
+            # Move other data to device
+            actions = batch['actions'].to(device, non_blocking=True)
+            dones = batch['dones'].to(device, non_blocking=True)
+            poses = batch['poses'].to(device, non_blocking=True)
             
-            rewards = rewards.unsqueeze(-1)
-            dones = torch.stack(batch_dones, dim=0).to(device)
-            poses = torch.stack(batch_poses, dim=0).to(device)
+            # Fix reward shape to (B, T, 1)
+            rewards = batch['rewards'].to(device, non_blocking=True)
+            if rewards.dim() == 2:
+                rewards = rewards.unsqueeze(-1)
             
             # forward
             output = model_wrapper.forward_pass(images, poses, actions)
@@ -388,11 +411,18 @@ def my_main(cfg: DictConfig):
             # backward and step 
             optimizer.zero_grad()
             batch_loss.backward()
+            
+            # Optional: Clip gradients to prevent explosion
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            
             optimizer.step()
             
+            loss_sum += batch_loss.item()
             batch_counter += 1
             
-            print(f'Epoch [{epoch+1}/{cfg.max_iters }], Batch [{batch_counter}/{(len(dataset) + batch_size - 1) // batch_size}], Loss: {batch_loss.item():.4f}, policy_loss: {policy_loss:.4f}')
+            # Print every N batches or at end of loop to reduce I/O overhead
+            if batch_counter % 10 == 0:
+                print(f'Epoch [{epoch+1}/{cfg.max_iters}], Batch [{batch_counter}/{len(train_loader)}], Loss: {batch_loss.item():.4f}')
 
         # save the model checkpoint
         if epoch % cfg.eval_vid_iters == 0:
