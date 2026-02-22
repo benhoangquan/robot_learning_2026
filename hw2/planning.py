@@ -1,5 +1,4 @@
-
-
+from simple_world_model import SimpleWorldModel
 from dreamerV3 import GRPBase
 import torch
 
@@ -140,8 +139,9 @@ class CEMPlanner(Planner):
         # TODO: Part 1.3 - Route to appropriate evaluation method
         ## Determine if using DreamerV3 or SimpleWorldModel and call appropriate method
         if type(self.world_model).__name__ == "DreamerV3": 
-            
-        pass
+            return self._evaluate_sequences_dreamer(initial_state, action_sequences)
+        elif type(self.world_model).__name__ == "SimpleWorldModel": 
+            return self._evaluate_sequences_simple(initial_state, action_sequences)
     
     def _evaluate_sequences_dreamer(self, initial_state, action_sequences):
         """
@@ -157,7 +157,37 @@ class CEMPlanner(Planner):
         """
         # TODO: Part 1.3 - Implement CEM planning with SimpleWorldModel
         ## Roll out action sequences using SimpleWorldModel and compute total rewards
-        pass
+        
+        # initial pose can only be (1, pose_dim) or (pose_dim, ) because 1 kind of pose only at first
+        # action sequence will be (B, T, action_dim) where B is batch, T is time/horizon
+        rollout_fn = self.world_model.forward
+        pose = initial_state['pose']
+        device = pose.device
+        
+        # matching (pose_dim, ) to (1, pose_dim)
+        if pose.dim() == 1: 
+            pose = pose.unsqueeze(0)
+        
+        # batching the initial pose (1, pose_dim) to (B, pose_dim) and reward (B, 1)
+        current_pose = pose.expand(self.num_samples, -1)
+        cumul_rewards = torch.zeros(self.num_samples, 1, device=device)
+        
+        for t in range(self.horizon):
+            # is this (B, 1, action_dim) or (B, action_dim)? Im leaning on the former. 
+            # If former, the shape will mismatch, and I will need to update the first function again.
+            # Update: its (B, action_dim)
+            action_t = action_sequences[:, t, :]
+            
+            # input pose: (B, pose_dim); action: (B, action_dim)
+            # output next_pose: (B, pose_dim), reward: (B, 1)
+            # is it sufficient to distinguish in my og function?
+            next_pose, reward_t = rollout_fn(current_pose, action_t)
+
+            cumul_rewards += reward_t
+            current_pose = next_pose
+            
+        return cumul_rewards.squeeze(-1)
+            
     
     def forward(self, observations=None, prev_actions=None, prev_state=None,
                 mask_=True, pose=None, last_action=None,
@@ -185,7 +215,33 @@ class CEMPlanner(Planner):
         """
         # TODO: Part 1.3 - Route forward pass to appropriate model
         ## Determine if using DreamerV3 or SimpleWorldModel and call appropriate method
-        pass
+        
+        if isinstance(self.world_model, SimpleWorldModel):
+            return self._forward_simple_cem(pose, return_full_sequence)
+        else:
+            # DreamerV3 path (Part 3)
+            return self._forward_dreamer(
+                observations, prev_actions, prev_state, return_full_sequence
+            )
+    
+    def _forward_simple_cem(self, pose, return_full_sequence):
+        """Forward for CEM + SimpleWorldModel: plan from current pose and return actions."""
+        if pose is None:
+            raise ValueError("CEMPlanner with SimpleWorldModel requires pose.")
+        # pose: (B, pose_dim), often B=1
+        initial_state = {"pose": pose}
+        best_actions, best_reward = self.plan(initial_state, return_best_sequence=True)
+        # best_actions: (horizon, action_dim), best_reward: float
+        if return_full_sequence:
+            actions = best_actions.unsqueeze(0)  # (1, horizon, action_dim)
+        else:
+            actions = best_actions[0:1]         # (1, action_dim) — first step only
+        reward_val = best_reward if isinstance(best_reward, float) else best_reward.item()
+        return {
+            "actions": actions,
+            "predicted_reward": reward_val,
+            "final_state": initial_state,
+        }
     
     def _forward_dreamer(self, observations, prev_actions, prev_state, return_full_sequence):
         """Forward pass for DreamerV3 model."""

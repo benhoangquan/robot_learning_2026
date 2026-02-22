@@ -96,7 +96,25 @@ class ModelTrainingWrapper:
         elif self.model_type == 'simple':
             # TODO: Part 1.2 - Implement SimpleWorldModel training loss
             ## Compute MSE loss between predicted and target poses/rewards
-            pass
+            
+            # output pose of fwd pass= (B, T, 7)
+            # output rew of fwd pass = (B, T, 1)
+            
+            # Compute loss of SimpleWorldModel
+            # pred_pose: (B, T, pose_dim) - also output of forward pass
+            # action: (B, T, action_dim) 
+            # target_pose: (B, T, pose_dim)
+            # target_reward (optional): (B, T, 1)
+            
+            cur_poses = poses[:, :-1 ,:]
+            cur_actions = actions[:, :-1, :]
+            
+            target_poses = poses[:, 1:, :]
+            target_rewards = rewards[:, 1:, :]
+            
+            return self.model.compute_loss(
+                cur_poses, cur_actions, target_poses, target_rewards
+            )
 
 
 class LIBERODataset(torch.utils.data.Dataset):
@@ -298,17 +316,16 @@ def my_main(cfg: DictConfig):
         print("[info] Using CircularBufferDataset with random data collection")
         dataset = CircularBufferDataset(cfg=cfg)
         print(f"[info] Initialized buffer with {len(dataset)} trajectories")
+    # Use Hugging Face dataset by default for portability; fall back to local HDF5 if requested.
+    elif cfg.dataset.load_dataset:
+        dataset = LIBERODatasetLeRobot(
+            repo_id=cfg.dataset.to_name,
+            transform=transforms.ToTensor(),
+            cfg=cfg
+        )
     else:
-        # Use Hugging Face dataset by default for portability; fall back to local HDF5 if requested.
-        if cfg.dataset.load_dataset:
-            dataset = LIBERODatasetLeRobot(
-                repo_id=cfg.dataset.to_name,
-                transform=transforms.ToTensor(),
-                cfg=cfg
-            )
-        else:
-            data_dir = getattr(cfg.dataset, 'data_dir', '/network/projects/real-g-grp/libero/targets_clean/')
-            dataset = LIBERODataset(data_dir, transform=transforms.ToTensor())
+        data_dir = getattr(cfg.dataset, 'data_dir', '/network/projects/real-g-grp/libero/targets_clean/')
+        dataset = LIBERODataset(data_dir, transform=transforms.ToTensor())
 
     batch_size = 32
     cfg.policy.sequence_length = 16
@@ -337,9 +354,44 @@ def my_main(cfg: DictConfig):
             batch_end = min(batch_start + batch_size, len(num_idx))
             batch_indices = num_idx[batch_start:batch_end]
             # Collect sequences for the batch
-            # [TODO]
             # TODO:    
             ## Implement data loading and training step for the batch
+            
+            # Get trajectory
+            batch_images, batch_actions, batch_rewards, batch_dones, batch_poses = [], [], [], [], []
+            for idx in batch_indices:
+                image, action, reward, done, pose = dataset[idx]
+                T = cfg.policy.sequence_length
+                image, action = image[:T], action[:T]
+                reward, done, pose = reward[:T], done[:T], pose[:T]
+                batch_images.append(image)
+                batch_actions.append(action)
+                batch_rewards.append(reward)
+                batch_dones.append(done)
+                batch_poses.append(pose)
+                
+            # Stack into batch and move to deivce
+            images = torch.stack(batch_images, dim=0).to(device)
+            actions = torch.stack(batch_actions, dim=0).to(device)
+            rewards = torch.stack(batch_rewards, dim=0).to(device)
+            
+            rewards = rewards.unsqueeze(-1)
+            dones = torch.stack(batch_dones, dim=0).to(device)
+            poses = torch.stack(batch_poses, dim=0).to(device)
+            
+            # forward
+            output = model_wrapper.forward_pass(images, poses, actions)
+            
+            # loss
+            batch_loss = model_wrapper.compute_loss(output, images, rewards, dones, poses, actions)
+            
+            # backward and step 
+            optimizer.zero_grad()
+            batch_loss.backward()
+            optimizer.step()
+            
+            batch_counter += 1
+            
             print(f'Epoch [{epoch+1}/{cfg.max_iters }], Batch [{batch_counter}/{(len(dataset) + batch_size - 1) // batch_size}], Loss: {batch_loss.item():.4f}, policy_loss: {policy_loss:.4f}')
 
         # save the model checkpoint
@@ -352,13 +404,13 @@ def my_main(cfg: DictConfig):
             if cfg.use_random_data:
                 # Add new random trajectories to the buffer
                 for traj in data['traj']:
-                    dones = np.zeros_like(traj['rewards'])
-                    dones[-1] = 1
+                    done = np.zeros_like(traj['rewards'])
+                    done[-1] = 1
                     ## observations need to be changed to channel first
                     observations = np.array(traj['observations'])  # (T, 1, H, W, C) -> (T, H, W, C)
                     observations = np.transpose(observations, (0, 3, 1, 2))  # (T, H, W, C) -> (T, C, H, W)
                     dataset.add_trajectory(observations, np.array(traj['actions']),
-                                           np.array(traj['rewards']), np.array(dones), np.array(traj['poses']))
+                                           np.array(traj['rewards']), np.array(done), np.array(traj['poses']))
                 print(f"[info] Added new random trajectories to buffer. Current buffer size: {len(dataset)}")
         
         # Step the learning rate scheduler after each epoch
