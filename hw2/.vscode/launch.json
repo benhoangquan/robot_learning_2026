@@ -1,0 +1,19 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: sim_eval (custom args)",
+            "type": "python",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "args": [
+                "sim.eval_episodes=5",
+                "simEval=[libero]",
+                "testing=true",
+                "model_type=simple",
+            ]
+        }
+    ]
+}
