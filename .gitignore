@@ -14,3 +14,12 @@ LIBERO/
 SimplerEnv/
 .vscode/
 .venv/
+.cursor
+.libero
+.lightning_studio
+.netrc
+.idea
+.bash_history
+.cursor-server
+.vscode-server
+.windsurf-server
