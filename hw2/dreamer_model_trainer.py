@@ -424,23 +424,33 @@ def my_main(cfg: DictConfig):
             if batch_counter % 10 == 0:
                 print(f'Epoch [{epoch+1}/{cfg.max_iters}], Batch [{batch_counter}/{len(train_loader)}], Loss: {batch_loss.item():.4f}')
 
-        # save the model checkpoint
+        # save the model checkpoint and optionally run eval
         if epoch % cfg.eval_vid_iters == 0:
             torch.save(model.state_dict(), f'model_epoch_{epoch+1}_batch_{batch_counter}.pth', pickle_module=dill)
+            skip_eval = getattr(cfg, 'skip_eval', False)
+            if not skip_eval:
                 # Evaluate the model using eval_libero from sim_eval
-            print("[info] Starting evaluation on LIBERO tasks...")
-            data = eval_libero(planner, device, cfg, iter_=epoch, log_dir="./", 
-                               wandb=wandb)
-            if cfg.use_random_data:
+                print("[info] Starting evaluation on LIBERO tasks...")
+                data = eval_libero(planner, device, cfg, iter_=epoch, log_dir="./", 
+                                   wandb=wandb)
+            else:
+                data = {'traj': []}
+            if cfg.use_random_data and not skip_eval:
                 # Add new random trajectories to the buffer
+                # Keep images in channel-last format (T, H, W, C) to match LIBERODataset /
+                # LIBERODatasetLeRobot; conversion to channel-first happens later in the
+                # training loop if needed.
                 for traj in data['traj']:
                     done = np.zeros_like(traj['rewards'])
                     done[-1] = 1
-                    ## observations need to be changed to channel first
-                    observations = np.array(traj['observations'])  # (T, 1, H, W, C) -> (T, H, W, C)
-                    observations = np.transpose(observations, (0, 3, 1, 2))  # (T, H, W, C) -> (T, C, H, W)
-                    dataset.add_trajectory(observations, np.array(traj['actions']),
-                                           np.array(traj['rewards']), np.array(done), np.array(traj['poses']))
+                    observations = np.array(traj['observations'])  # (T, H, W, C')
+                    dataset.add_trajectory(
+                        observations,
+                        np.array(traj['actions']),
+                        np.array(traj['rewards']),
+                        np.array(done),
+                        np.array(traj['poses']),
+                    )
                 print(f"[info] Added new random trajectories to buffer. Current buffer size: {len(dataset)}")
         
         # Step the learning rate scheduler after each epoch

@@ -56,6 +56,8 @@ testing: false
 eval_vid_iters: 50
 gradient_accumulation_steps: 1
 
+skip_eval: true
+
 simEval: ["libero"] # "simpler_env" or "libero"
 sim:
   eval_episodes: 1

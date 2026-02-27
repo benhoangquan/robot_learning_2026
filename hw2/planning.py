@@ -164,11 +164,15 @@ class CEMPlanner(Planner):
         rollout_fn = self.world_model.forward
         pose = initial_state['pose']
         device = pose.device
-        
-        # matching (pose_dim, ) to (1, pose_dim)
-        if pose.dim() == 1: 
+
+        # Normalize pose shape to (1, pose_dim)
+        if pose.dim() == 3:
+            # e.g. (B=1, T=1, pose_dim) -> take last timestep -> (1, pose_dim)
+            pose = pose[:, -1, :]
+        elif pose.dim() == 1:
+            # (pose_dim,) -> (1, pose_dim)
             pose = pose.unsqueeze(0)
-        
+
         # batching the initial pose (1, pose_dim) to (B, pose_dim) and reward (B, 1)
         current_pose = pose.expand(self.num_samples, -1)
         cumul_rewards = torch.zeros(self.num_samples, 1, device=device)
@@ -249,13 +253,21 @@ class CEMPlanner(Planner):
         # TODO: Part 4.2 - Implement DreamerV3 forward pass for policy
         ## Encode observations, roll through RSSM, and plan with policy from current state
         pass
-
-        # [Imagine method remains mostly the same, ensuring valid input shapes for heads]
+    
     def preprocess_state(self, image):
-        """Preprocess observation image"""
-        # TODO: Preprocess image for input
-        ## Resize, normalize, and convert to channel-first format
-        pass
+        """
+        Preprocess observation image for planning.
+        
+        This delegates to the underlying world model when available so that
+        evaluation code (e.g., `eval_libero`) can call `planner.preprocess_state`
+        and still get a numeric array / tensor suitable for conversion to
+        `torch.tensor(...)`.
+        """
+        # Prefer the world model's preprocessing if it defines one
+        if hasattr(self.world_model, "preprocess_state") and callable(getattr(self.world_model, "preprocess_state")):
+            return self.world_model.preprocess_state(image)
+        # Fallback to GRPBase implementation
+        return super().preprocess_state(image)
 
 
 class PolicyPlanner(GRPBase):
