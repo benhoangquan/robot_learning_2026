@@ -16,14 +16,7 @@ loss_coeffs:
 planner:
   horizon: 12
   num_iterations: 3
-  num_samples: 100policy = nn.Sequential(
-            nn.Linear(7, 256),
-            nn.ReLU(),
-            nn.Linear(256, 256),
-            nn.ReLU(),
-            nn.Linear(256, 7)
-        )
-        policy.to(device)
+  num_samples: 100
   num_elites: 20
   temperature: 0.1
   learning_rate: 0.001
@@ -62,6 +55,8 @@ policy:
 testing: false
 eval_vid_iters: 50
 gradient_accumulation_steps: 1
+
+skip_eval: true
 
 simEval: ["libero"] # "simpler_env" or "libero"
 sim:

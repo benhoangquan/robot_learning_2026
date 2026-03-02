@@ -1,5 +1,4 @@
-
-
+from simple_world_model import SimpleWorldModel
 from dreamerV3 import GRPBase
 import torch
 
@@ -55,8 +54,16 @@ class CEMPlanner(Planner):
         """
         # TODO: Part 1.3 - Initialize CEM planner
         ## Set up world model reference and determine if using DreamerV3 or SimpleWorldModel
-        pass
-        
+        super().__init__(cfg)
+        self.world_model = world_model
+        self.action_dim = action_dim
+        self.cfg = cfg
+        self.horizon = cfg.planner.horizon
+        self.num_samples = cfg.planner.num_samples
+        self.num_elites = cfg.planner.num_elites
+        self.num_iterations = cfg.planner.num_iterations
+
+    @torch.no_grad()
     def plan(self, initial_state, return_best_sequence=True):
         """
         Plan action sequences using CEM to maximize predicted rewards.
@@ -73,8 +80,52 @@ class CEMPlanner(Planner):
         """
         # TODO: Part 1.3 - Implement CEM planning algorithm
         ## Sample action sequences, evaluate with world model, select elites, update distribution
-        pass
-    
+
+        # Random actions samples and scale to normalize to -1, 1
+        # variable name with s with more than 1 samples
+
+
+        # TODO if state/pose dim = (B, T, pose_dim)
+        if isinstance(self.world_model, SimpleWorldModel):
+
+            pose = initial_state["pose"]
+            device = pose.device
+            
+            mean_actions = torch.zeros(self.horizon, self.action_dim, device=device)
+            std_actions = torch.ones(self.horizon, self.action_dim, device=device)
+
+            for iteration in range(self.num_iterations):
+                # # distribution sampling slow!
+                # actions = [torch.normal(mean_actions, std_actions, device=device) for _ in range(self.num_samples)]
+                # actions = torch.stack(actions)
+                
+                # Vectorized Sampling
+                # N = num_samples, H = horizon, A = action_dim
+                mean = mean_actions.unsqueeze(0).expand(self.num_samples, -1, -1)  # (N, H, A)
+                std  = std_actions.unsqueeze(0).expand(self.num_samples, -1, -1)   # (N, H, A)
+                actions = torch.normal(mean, std)  # (N, H, A)
+                
+                # Normalized actions
+                actions = actions.clamp(-1.0, 1.0)
+                
+                # eval seqs
+                rewards = self._evaluate_sequences(initial_state, actions)
+
+                # update mean/std from the elites
+                # choose n actions sequences that have the highest rewards (arg max?) then calculate mean/std from that
+                _, idx = torch.topk(rewards, k=self.num_elites)
+                best_id = torch.argmax(rewards)
+                elites = actions[idx]
+                mean_actions = elites.mean(dim=0)
+                std_actions = elites.std(dim=0) + 1e-6
+
+            # return top action/action mean and top reward/reward mean
+            if return_best_sequence: 
+                return actions[best_id], rewards[best_id].item()
+            else: 
+                return mean_actions, rewards.mean()
+
+ 
     def _evaluate_sequences(self, initial_state, action_sequences):
         """
         Evaluate a batch of action sequences by rolling them out in the world model.
@@ -88,7 +139,10 @@ class CEMPlanner(Planner):
         """
         # TODO: Part 1.3 - Route to appropriate evaluation method
         ## Determine if using DreamerV3 or SimpleWorldModel and call appropriate method
-        pass
+        if type(self.world_model).__name__ == "DreamerV3": 
+            return self._evaluate_sequences_dreamer(initial_state, action_sequences)
+        elif type(self.world_model).__name__ == "SimpleWorldModel": 
+            return self._evaluate_sequences_simple(initial_state, action_sequences)
     
     def _evaluate_sequences_dreamer(self, initial_state, action_sequences):
         """
@@ -104,7 +158,41 @@ class CEMPlanner(Planner):
         """
         # TODO: Part 1.3 - Implement CEM planning with SimpleWorldModel
         ## Roll out action sequences using SimpleWorldModel and compute total rewards
-        pass
+        
+        # initial pose can only be (1, pose_dim) or (pose_dim, ) because 1 kind of pose only at first
+        # action sequence will be (B, T, action_dim) where B is batch, T is time/horizon
+        rollout_fn = self.world_model.forward
+        pose = initial_state['pose']
+        device = pose.device
+
+        # Normalize pose shape to (1, pose_dim)
+        if pose.dim() == 3:
+            # e.g. (B=1, T=1, pose_dim) -> take last timestep -> (1, pose_dim)
+            pose = pose[:, -1, :]
+        elif pose.dim() == 1:
+            # (pose_dim,) -> (1, pose_dim)
+            pose = pose.unsqueeze(0)
+
+        # batching the initial pose (1, pose_dim) to (B, pose_dim) and reward (B, 1)
+        current_pose = pose.expand(self.num_samples, -1)
+        cumul_rewards = torch.zeros(self.num_samples, 1, device=device)
+        
+        for t in range(self.horizon):
+            # is this (B, 1, action_dim) or (B, action_dim)? Im leaning on the former. 
+            # If former, the shape will mismatch, and I will need to update the first function again.
+            # Update: its (B, action_dim)
+            action_t = action_sequences[:, t, :]
+            
+            # input pose: (B, pose_dim); action: (B, action_dim)
+            # output next_pose: (B, pose_dim), reward: (B, 1)
+            # is it sufficient to distinguish in my og function?
+            next_pose, reward_t = rollout_fn(current_pose, action_t)
+
+            cumul_rewards += reward_t
+            current_pose = next_pose
+            
+        return cumul_rewards.squeeze(-1)
+            
     
     def forward(self, observations=None, prev_actions=None, prev_state=None,
                 mask_=True, pose=None, last_action=None,
@@ -132,20 +220,54 @@ class CEMPlanner(Planner):
         """
         # TODO: Part 1.3 - Route forward pass to appropriate model
         ## Determine if using DreamerV3 or SimpleWorldModel and call appropriate method
-        pass
+        
+        if isinstance(self.world_model, SimpleWorldModel):
+            return self._forward_simple_cem(pose, return_full_sequence)
+        else:
+            # DreamerV3 path (Part 3)
+            return self._forward_dreamer(
+                observations, prev_actions, prev_state, return_full_sequence
+            )
+    
+    def _forward_simple_cem(self, pose, return_full_sequence):
+        """Forward for CEM + SimpleWorldModel: plan from current pose and return actions."""
+        if pose is None:
+            raise ValueError("CEMPlanner with SimpleWorldModel requires pose.")
+        # pose: (B, pose_dim), often B=1
+        initial_state = {"pose": pose}
+        best_actions, best_reward = self.plan(initial_state, return_best_sequence=True)
+        # best_actions: (horizon, action_dim), best_reward: float
+        if return_full_sequence:
+            actions = best_actions.unsqueeze(0)  # (1, horizon, action_dim)
+        else:
+            actions = best_actions[0:1]         # (1, action_dim) — first step only
+        reward_val = best_reward if isinstance(best_reward, float) else best_reward.item()
+        return {
+            "actions": actions,
+            "predicted_reward": reward_val,
+            "final_state": initial_state,
+        }
     
     def _forward_dreamer(self, observations, prev_actions, prev_state, return_full_sequence):
         """Forward pass for DreamerV3 model."""
         # TODO: Part 4.2 - Implement DreamerV3 forward pass for policy
         ## Encode observations, roll through RSSM, and plan with policy from current state
         pass
-
-        # [Imagine method remains mostly the same, ensuring valid input shapes for heads]
+    
     def preprocess_state(self, image):
-        """Preprocess observation image"""
-        # TODO: Preprocess image for input
-        ## Resize, normalize, and convert to channel-first format
-        pass
+        """
+        Preprocess observation image for planning.
+        
+        This delegates to the underlying world model when available so that
+        evaluation code (e.g., `eval_libero`) can call `planner.preprocess_state`
+        and still get a numeric array / tensor suitable for conversion to
+        `torch.tensor(...)`.
+        """
+        # Prefer the world model's preprocessing if it defines one
+        if hasattr(self.world_model, "preprocess_state") and callable(getattr(self.world_model, "preprocess_state")):
+            return self.world_model.preprocess_state(image)
+        # Fallback to GRPBase implementation
+        return super().preprocess_state(image)
 
 
 class PolicyPlanner(GRPBase):

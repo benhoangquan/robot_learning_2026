@@ -4,6 +4,9 @@ import h5py
 import numpy as np
 import torch
 
+import warnings
+warnings.filterwarnings("ignore")
+
 def get_text_tokens(cfg, tokenizer, text_model, goal, model=None):
     """
     Get the text tokens/embeddings for the goal.
@@ -162,10 +165,10 @@ def eval_libero(model, device, cfg, iter_=0, log_dir="./",
         #               wandb, iter_, tokenizer=None, text_model=None):
     
     from libero.libero import benchmark
-    from libero.libero.envs import OffScreenRenderEnv, DenseRewardEnv
+    from libero.libero.envs import OffScreenRenderEnv
     import os
     from libero.libero.utils import get_libero_path
-    from gymnasium.wrappers import FrameStackObservation
+    from gymnasium.wrappers import FrameStack
     from einops import rearrange
     from collections import deque
 

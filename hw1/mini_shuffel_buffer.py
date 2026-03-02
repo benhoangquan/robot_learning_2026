@@ -219,7 +219,7 @@ class CircularBuffer:
 
         cfg.action_dim = len(cfg.dataset.action_mean)
 
-        self._dataset_indecies = self._cfg.dataset.dataset_indicies
+        self._dataset_indicies = self._cfg.dataset.dataset_indicies
         start_ = time.time()
         if self._cfg.dataset.load_dataset is True:
             # Load the dataset from a file
@@ -350,8 +350,12 @@ class CircularBuffer:
         from torchvision.transforms import v2 # Recommend v2 for new code
         from einops import rearrange
         if self._cfg.policy.use_image_augmentations:
-            # TODO:
-            ## Add image Augmentations to improve performance
+            # Add image Augmentations to improve performance
+            transform_crop_scale = v2.Compose([
+                v2.RandomResizedCrop(size=(cfg.image_shape[0], cfg.image_shape[1]), scale=(0.8, 1.0), antialias=True),
+                v2.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+                v2.ToDtype(torch.float32)
+            ])
         else:
             transform_crop_scale = v2.Compose([
                 v2.ToDtype(torch.float32) # Convert to float [0,1] after crop/resize
@@ -480,7 +484,14 @@ class CircularBuffer:
         import datasets
         from PIL import Image
 
-        ##TODO: fix bug where the saved data can be full of empty arrays after self._count
+        save_count = self._count if self._count < self._size else self._size
+        data_to_save = {}
+        for k, v in self._dataset_tmp.items():
+            if v is None: continue
+            val = v[:save_count]
+            if isinstance(val, torch.Tensor):
+                val = val.cpu().numpy()
+            data_to_save[k] = val
 
         ## Trim the dataset to the actual count
         self._dataset_tmp = {k: v for k, v in self._dataset_tmp.items() if not (k == "t5_language_embedding" and self._cfg.dataset.encode_with_t5 is False)}
