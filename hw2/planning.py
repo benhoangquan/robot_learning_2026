@@ -1,5 +1,5 @@
 from simple_world_model import SimpleWorldModel
-from dreamerV3 import GRPBase
+from dreamerV3 import DreamerV3, GRPBase
 import torch
 
 
@@ -64,7 +64,7 @@ class CEMPlanner(Planner):
         self.num_iterations = cfg.planner.num_iterations
 
     @torch.no_grad()
-    def plan(self, initial_state, return_best_sequence=True):
+    def plan(self, initial_state, return_best_sequence=True, init_mean=None, init_std=None):
         """
         Plan action sequences using CEM to maximize predicted rewards.
         
@@ -90,11 +90,20 @@ class CEMPlanner(Planner):
 
             pose = initial_state["pose"]
             device = pose.device
-            
-            mean_actions = torch.zeros(self.horizon, self.action_dim, device=device)
-            std_actions = torch.ones(self.horizon, self.action_dim, device=device)
+            best_id = torch.tensor(0, device=device)
+            actions = torch.zeros((self.num_samples, self.horizon, self.action_dim), device=device)
 
-            for iteration in range(self.num_iterations):
+            if init_mean is None: 
+                mean_actions = torch.zeros(self.horizon, self.action_dim, device=device)
+            else: 
+                mean_actions = init_mean.expand(self.horizon, -1).contiguous()
+                
+            if init_std is None: 
+                std_actions = torch.ones(self.horizon, self.action_dim, device=device)
+            else: 
+                std_actions = init_std.expand(self.horizon, -1).contiguous()
+
+            for _ in range(self.num_iterations):
                 # # distribution sampling slow!
                 # actions = [torch.normal(mean_actions, std_actions, device=device) for _ in range(self.num_samples)]
                 # actions = torch.stack(actions)
@@ -123,7 +132,7 @@ class CEMPlanner(Planner):
             if return_best_sequence: 
                 return actions[best_id], rewards[best_id].item()
             else: 
-                return mean_actions, rewards.mean()
+                return mean_actions, float(rewards.mean())
 
  
     def _evaluate_sequences(self, initial_state, action_sequences):
@@ -139,9 +148,9 @@ class CEMPlanner(Planner):
         """
         # TODO: Part 1.3 - Route to appropriate evaluation method
         ## Determine if using DreamerV3 or SimpleWorldModel and call appropriate method
-        if type(self.world_model).__name__ == "DreamerV3": 
+        if isinstance(self.world_model, DreamerV3): 
             return self._evaluate_sequences_dreamer(initial_state, action_sequences)
-        elif type(self.world_model).__name__ == "SimpleWorldModel": 
+        elif isinstance(self.world_model, SimpleWorldModel): 
             return self._evaluate_sequences_simple(initial_state, action_sequences)
     
     def _evaluate_sequences_dreamer(self, initial_state, action_sequences):
@@ -293,22 +302,43 @@ class PolicyPlanner(GRPBase):
         """
         # TODO: Part 2.2 - Initialize Policy planner
         ## Set up world model, policy model, optimizer, and scheduler
-        pass
+        super().__init__(cfg)
+        self.world_model_name = type(world_model).__name__ # World model is not necessary once saved in cem_planner
+        self.policy_model = policy_model
+        self.action_dim = action_dim
+        self.horizon = horizon if horizon else cfg.planner.horizon
+        self.optimizer = torch.optim.Adam(self.policy_model.parameters(), lr=cfg.planner.learning_rate)
+        if cfg.lr_schedule == "inverse_sqrt":
+            def lr_lambda(current_step: int):
+                current_step = max(1, current_step)
+                return 1.0 / (current_step**0.5)
+            self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
+        else:
+            self.scheduler = torch.optim.lr_scheduler.LinearLR(self.optimizer)
+        self.loss_fn = torch.nn.GaussianNLLLoss(full=True)
+        self.cem_planner = CEMPlanner(world_model, self.action_dim, cfg)
 
     def update(self, states, actions):
         """
         Docstring for update
         Update the policy model using collected states and actions.
         
-        :param self: Description
-        :param states: Description
-        :param actions: Description
+        :param self: Description 
+        :param states: Description - (len(states), pose_dim, )
+        :param actions: Description - (len(actions), actions_dim, )
         """
         # TODO: Part 2.2 - Implement policy training
         ## Train the policy using behavior cloning on collected state-action pairs
-        pass
-
-    
+        
+        self.optimizer.zero_grad()
+        preds = self.policy_model(states) # pred is combination of mean and var
+        mean_pred, std_pred = torch.split(preds, split_size=self.action_dim, dim=-1)
+        var_pred = torch.exp(2 * std_pred)
+        loss = self.loss_fn(mean_pred, actions, var_pred)
+        loss.backward()
+        self.optimizer.step()
+        self.scheduler.step()
+        
     def plan(self, initial_state, return_best_sequence=True):
         """
         Plan action sequences by rolling out the policy model over the horizon.
@@ -325,8 +355,22 @@ class PolicyPlanner(GRPBase):
         """
         # TODO: Part 2.2 - Implement policy rollout planning
         ## Roll out the policy over the horizon, predicting actions and accumulating rewards
-        pass
-    
+        if self.world_model_name == "SimpleWorldModel":
+            initial_pose = initial_state['pose']
+            if initial_pose.dim() == 1:
+                initial_pose = initial_pose.unsqueeze(0)  # ensure (1, 7)
+            action_pred = self.policy_model(initial_pose)
+            action_mean, action_std = torch.split(action_pred, split_size_or_sections=self.action_dim, dim=-1)
+            action_var = torch.exp(2 * action_std)
+
+            best_actions, best_reward = self.cem_planner.plan(
+                initial_state=initial_state, 
+                return_best_sequence=return_best_sequence,
+                init_mean=action_mean, 
+                init_std=action_var   
+            )
+            return best_actions, best_reward
+        
     def forward(self, observations=None, prev_actions=None, prev_state=None,
                 mask_=True, pose=None, last_action=None,
                 text_goal=None, goal_image=None, return_full_sequence=False):
@@ -353,7 +397,13 @@ class PolicyPlanner(GRPBase):
         """
         # TODO: Part 2.2 - Route forward pass to appropriate model
         ## Determine if using DreamerV3 or SimpleWorldModel and call appropriate method
-        pass
+        if self.world_model_name == "SimpleWorldModel":
+            return self._forward_simple(pose, return_full_sequence)
+        else:
+            # DreamerV3 path (Part 3)
+            return self._forward_dreamer(
+                observations, prev_actions, prev_state, return_full_sequence
+            )
     
     def _forward_dreamer(self, observations, prev_actions, prev_state, return_full_sequence):
         """Forward pass for DreamerV3 model."""
@@ -365,7 +415,19 @@ class PolicyPlanner(GRPBase):
         """Forward pass for SimpleWorldModel."""
         # TODO: Part 2.2 - Implement SimpleWorldModel forward pass for policy
         ## Plan from current pose using policy with SimpleWorldModel
-        pass
+        initial_state = {"pose": pose}
+        best_actions, best_reward = self.plan(initial_state, return_best_sequence=True)
+        # best_actions: (horizon, action_dim), best_reward: float
+        if return_full_sequence:
+            actions = best_actions.unsqueeze(0)  # (1, horizon, action_dim)
+        else:
+            actions = best_actions[0:1]         # (1, action_dim) — first step only
+        reward_val = best_reward if isinstance(best_reward, float) else best_reward.item()
+        return {
+            "actions": actions,
+            "predicted_reward": reward_val,
+            "final_state": initial_state,
+        }
 
 
 class RandomPlanner(GRPBase):
