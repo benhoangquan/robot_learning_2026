@@ -16,6 +16,8 @@ from libero.libero.envs import OffScreenRenderEnv, DenseRewardEnv
 import random
 from sim_eval import eval_libero
 from collections import deque
+import datasets
+from datasets import load_dataset
 
 
 # Factory function to instantiate the correct model
@@ -186,7 +188,7 @@ class CircularBufferDataset(torch.utils.data.Dataset):
             return
 
         indices = np.random.choice(len(dataset), size=num_to_load, replace=False)
-        for idx in range(num_to_load):
+        for idx in indices:
             images, actions, rewards, dones, poses = dataset[idx]
 
             # dones = np.zeros_like(rewards)
@@ -224,8 +226,6 @@ class CircularBufferDataset(torch.utils.data.Dataset):
         traj = self.trajectories[idx]
         return traj['images'], traj['actions'], traj['rewards'], traj['dones'], traj['poses']
 
-from datasets import load_dataset
-import datasets
 class LIBERODatasetLeRobot(torch.utils.data.Dataset):
 
 
@@ -289,7 +289,7 @@ def my_main(cfg: DictConfig):
     if cfg.use_policy:
         print("[info] Using policy-based planner (CEMPlanner with policy)")
         import torch.nn as nn
-        # Stochastic policy that outputs both mean and log_std for Gaussian distribution
+        # Always create the policy network first so it exists before loading weights.
         policy = nn.Sequential(
             nn.Linear(7, 256),
             nn.ReLU(),
@@ -298,6 +298,16 @@ def my_main(cfg: DictConfig):
             nn.Linear(256, 14)  # Output 14: 7 for mean, 7 for log_std
         )
         policy.to(device)
+        # If cfg.load_policy is specified, load the policy weights into the network.
+        if hasattr(cfg, "load_policy") and cfg.load_policy:
+            print(f"[info] Loading policy weights from: {cfg.load_policy}")
+            state_dict = torch.load(cfg.load_policy, map_location=device)
+            # If the saved state dict is under 'model_state_dict' key, adjust accordingly.
+            if "model_state_dict" in state_dict:
+                policy.load_state_dict(state_dict["model_state_dict"])
+            else:
+                policy.load_state_dict(state_dict)
+            
         planner = PolicyPlanner(
             model, 
             policy_model=policy,
@@ -327,10 +337,13 @@ def my_main(cfg: DictConfig):
         data_dir = getattr(cfg.dataset, 'data_dir', '/network/projects/real-g-grp/libero/targets_clean/')
         dataset = LIBERODataset(data_dir, transform=transforms.ToTensor())
 
-    batch_size = 32
-    cfg.policy.sequence_length = 16
+    batch_size = cfg.batch_size
     # Define optimizer and loss function
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    # Include policy parameters when use_policy is True so the policy network is trained.
+    params = list(model.parameters())
+    if cfg.use_policy:
+        params += list(policy.parameters())
+    optimizer = torch.optim.Adam(params, lr=0.001)
     
     # Add linear learning rate scheduler that decays to 0 over training
     scheduler = torch.optim.lr_scheduler.LinearLR(
@@ -339,16 +352,16 @@ def my_main(cfg: DictConfig):
         end_factor=0.01,    # End at 0 learning rate
         total_iters=cfg.max_iters     # Decay over num_epochs
     )
-    policy_loss = 0
-    
-        # Helper to slice sequences to the correct length T
+    # Helper to slice sequences to the correct length T
     def collate_fn(batch):
         T = cfg.policy.sequence_length
         # Pre-allocate lists
         images, actions, rewards, dones, poses = [], [], [], [], []
         
         for item in batch:
-            # item is (image, action, reward, done, pose)
+            # Skip trajectories that are shorter than T to avoid shape mismatches.
+            if item[0].shape[0] < T:
+                continue
             # Take only the first T steps (or implement random window sampling here)
             images.append(item[0][:T])
             actions.append(item[1][:T])
@@ -397,10 +410,12 @@ def my_main(cfg: DictConfig):
             dones = batch['dones'].to(device, non_blocking=True)
             poses = batch['poses'].to(device, non_blocking=True)
             
-            # Fix reward shape to (B, T, 1)
+            # Fix reward and done shapes to (B, T, 1)
             rewards = batch['rewards'].to(device, non_blocking=True)
             if rewards.dim() == 2:
                 rewards = rewards.unsqueeze(-1)
+            if dones.dim() == 2:
+                dones = dones.unsqueeze(-1)
             
             # forward
             output = model_wrapper.forward_pass(images, poses, actions)
@@ -427,6 +442,8 @@ def my_main(cfg: DictConfig):
         # save the model checkpoint and optionally run eval
         if epoch % cfg.eval_vid_iters == 0:
             torch.save(model.state_dict(), f'model_epoch_{epoch+1}_batch_{batch_counter}.pth', pickle_module=dill)
+            if cfg.use_policy:
+                torch.save(policy.state_dict(), 'policy.pth', pickle_module=dill)
             skip_eval = getattr(cfg, 'skip_eval', False)
             if not skip_eval:
                 # Evaluate the model using eval_libero from sim_eval

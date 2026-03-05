@@ -5,6 +5,7 @@ defaults:
 model_type: 'simple'
 use_random_data: true # If true, the trainer will collect random trajectories and add them to the buffer, instead of training a world model and using it for planning.
 use_policy: true # If true, the trainer will train a policy network instead of a world model. The policy will be trained using behavior cloning on the collected trajectories.
+load_policy: null # If specified, the trainer will load the policy weights from the given path.
 
 # Loss coefficients for model training
 loss_coeffs:
@@ -56,7 +57,7 @@ testing: false
 eval_vid_iters: 50
 gradient_accumulation_steps: 1
 
-skip_eval: true
+skip_eval: false
 
 simEval: ["libero"] # "simpler_env" or "libero"
 sim:

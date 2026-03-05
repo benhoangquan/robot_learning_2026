@@ -10,6 +10,8 @@
 #SBATCH --error=part1.err
 #SBATCH --job-name=part1
 
+export MUJOCO_GL=osmesa
+export PYOPENGL_PLATFORM=osmesa
 python hw2/dreamer_model_trainer.py \
     model_type=simple \
     planner.type=cem \
@@ -17,4 +19,4 @@ python hw2/dreamer_model_trainer.py \
     planner.num_samples=100 \
     planner.num_elites=10 \
     experiment.name=q1_simple_cem \
-    use_policy=true \
+    use_policy=false \

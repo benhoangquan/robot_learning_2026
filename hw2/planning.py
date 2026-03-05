@@ -1,6 +1,6 @@
 from simple_world_model import SimpleWorldModel
 from dreamerV3 import DreamerV3, GRPBase
-import torch
+import torch 
 
 
 class Planner(GRPBase):
