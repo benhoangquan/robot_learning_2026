@@ -48,7 +48,7 @@ class SimpleWorldModel(GRPBase):
         # TODO: Part 1.1 - Implement forward pass
         ## Concatenate pose and action, pass through feature network and output heads
         # X shape (B, T, in_dim) or (B, in_dim)
-        x = torch.cat((pose, action), axis=-1)
+        x = torch.cat((pose.float(), action.float()), axis=-1)
 
         pose_dim = pose.shape[-1]
         is_seq = x.dim() == 3 
@@ -107,10 +107,10 @@ class SimpleWorldModel(GRPBase):
         # TODO: Part 1.2 - Implement SimpleWorldModel loss computation
         ## Compute MSE loss for pose and reward predictions
         pred_pose, pred_reward = self.forward(pose, action)
-        pose_loss = F.mse_loss(pred_pose, target_pose)
+        pose_loss = F.mse_loss(pred_pose, target_pose.float())
         
         if target_reward is not None:
-            reward_loss = F.mse_loss(pred_reward, target_reward)
+            reward_loss = F.mse_loss(pred_reward, target_reward.float())
             return reward_loss + pose_loss
         else: 
             return pose_loss

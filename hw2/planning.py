@@ -96,12 +96,12 @@ class CEMPlanner(Planner):
             if init_mean is None: 
                 mean_actions = torch.zeros(self.horizon, self.action_dim, device=device)
             else: 
-                mean_actions = init_mean.expand(self.horizon, -1).contiguous()
+                mean_actions = init_mean.reshape(self.action_dim).expand(self.horizon, -1).contiguous()
                 
             if init_std is None: 
                 std_actions = torch.ones(self.horizon, self.action_dim, device=device)
             else: 
-                std_actions = init_std.expand(self.horizon, -1).contiguous()
+                std_actions = init_std.reshape(self.action_dim).expand(self.horizon, -1).contiguous()
 
             for _ in range(self.num_iterations):
                 # # distribution sampling slow!

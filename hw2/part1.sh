@@ -10,8 +10,8 @@
 #SBATCH --error=part1.err
 #SBATCH --job-name=part1
 
-export MUJOCO_GL=osmesa
-export PYOPENGL_PLATFORM=osmesa
+export MUJOCO_GL=egl
+export PYOPENGL_PLATFORM=egl
 python hw2/dreamer_model_trainer.py \
     model_type=simple \
     planner.type=cem \
