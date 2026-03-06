@@ -1,3 +1,5 @@
+from tensorflow.python.ops.gen_batch_ops import batch
+from networkx import kneser_graph
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -128,7 +130,7 @@ class GRPBase(nn.Module):
 
 class DreamerV3(GRPBase):
     def __init__(self, 
-                 obs_shape=(3, 128, 128),  # Updated default to match your error
+                 obs_shape=(3, 128, 128),  # Updated default to match your error # (C, H, W )
                  action_dim=6, 
                  stoch_dim=32, 
                  discrete_dim=32, 
@@ -136,7 +138,50 @@ class DreamerV3(GRPBase):
                  hidden_dim=512, cfg=None):
         # TODO: Part 3.1 - Initialize DreamerV3 architecture
         ## Define encoder, RSSM components (GRU, prior/posterior nets), and decoder heads
-        pass
+        # Save argument first
+        super().__init__(cfg)
+        self.obs_shape = obs_shape
+        self.action_dim = action_dim
+        self.stoch_dim = stoch_dim
+        self.discrete_dim = discrete_dim
+        self.deter_dim = deter_dim
+        self.hidden_dim = hidden_dim 
+        self.embed_dim = hidden_dim
+        self.state_dim = deter_dim + stoch_dim * discrete_dim
+        
+        # Big net inside
+        class CNNEncoder(nn.Module):
+            def __init__(self, obs_shape, kernel_size, stride, embed_dim): 
+                super().__init__(self)
+                C, H, W = obs_shape
+                out_dim = lambda w, k, p, s: (w - k + 2 * p) // s + 1
+                
+                out1 = out_dim(max(H, W), kernel_size, 0, stride)
+                out2 = out_dim(out1, kernel_size, 0, stride)
+                out3 = out_dim(out2, kernel_size, 0, stride)
+                
+                self.conv1 = nn.Conv2d(C, 32, kernel_size, stride)
+                self.conv2 = nn.Conv2d(32, 64, kernel_size, stride)
+                self.conv3 = nn.Conv2d(64, 128, kernel_size, stride)
+                self.flatten = nn.Flatten(1)
+                self.fc = nn.Linear(128 * out3 * out3, embed_dim)
+            
+            def forward(self, x):
+                import torch.nn.functional as F
+                x = F.relu(self.conv1(x))
+                x = F.relu(self.conv2(x))
+                x = F.relu(self.conv3(x))
+                x = self.flatten(x)
+                return self.fc(x)
+        
+        # Input: (B, C, H, W)  where C, H, W come from obs_shape
+        self.encoder = CNNEncoder(obs_shape, kernel_size=4, stride=2, embed_dim=self.embed_dim)
+        self.gru = nn.GRU(input_size=self.state_dim, hidden_size=self.hidden_dim, batch_first=False)
+        self.priorMLP = nn.Sequential(nn.Linear(self.deter_dim, self.hidden_dim), nn.ReLU(), nn.Linear(self.hidden_dim, self.stoch_dim * self.discrete_dim))
+        self.postMLP = nn.Sequential(nn.Linear, nn.ReLU, nn.Linear())
+        self.decoder = nn.Sequential(nn.Linear, nn.ReLU, nn.Linear())
+        self.rewardMLP = nn.Sequential(nn.Linear, nn.ReLU, nn.Linear())
+        self.continueMLP = nn.Sequential(nn.Linear, nn.ReLU, nn.Linear())
 
     # ... [Helper methods same as before] ...
 
@@ -150,6 +195,9 @@ class DreamerV3(GRPBase):
     def sample_stochastic(self, logits, training=True):
         # TODO: Part 3.1 - Implement stochastic sampling
         ## Sample from discrete categorical distribution using logits
+        # what si 
+        
+        
         pass
 
     def rssm_step(self, prev_state, action, embed=None):
