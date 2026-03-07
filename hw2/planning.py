@@ -159,11 +159,12 @@ class CEMPlanner(Planner):
         B, T = self.num_samples, self.horizon
         
         # initial_state will have only 1 h and 1 z so we need to expand that 
-        state = initial_state
-        state['h'] = state['h'].expand(B, -1)
-        state['z'] = state['z'].expand(B, -1)
+        state = {}
+        state['h'] = initial_state['h'].expand(B, -1)
+        state['z'] = initial_state['z'].expand(B, -1)
+        device = state['h'].device
         
-        cumul_rewards = torch.zeros(B, 1)
+        cumul_rewards = torch.zeros(B, 1, device=device)
         
         # no forward pass here, fwd pass for training
         # in inference, we use prior logit instead of post logit
@@ -171,7 +172,7 @@ class CEMPlanner(Planner):
         for t in range(T):
             action = action_sequences[:, t]
             state = self.world_model.rssm_step(state, action, embed=None)
-            x = torch.cat((state["h"], state['z']), dim=1)
+            x = torch.cat((state["z"], state['h']), dim=1)
             reward = self.world_model.rewardMLP(x)
             cumul_rewards += reward
         return cumul_rewards.squeeze(-1)
@@ -286,7 +287,7 @@ class CEMPlanner(Planner):
         for t in range(T):
             obs_t = observations[:, t].permute(0, 3, 1, 2)
             emb_t = self.world_model.encoder(obs_t) # (B, embed_dim)
-            action_t = prev_actions[:, t]
+            action_t = prev_actions[:, t] if prev_actions is not None else torch.zeros((B, self.action_dim), device=device)
             
             prev_state = self.world_model.rssm_step(prev_state, action_t, emb_t)
             
@@ -402,18 +403,17 @@ class PolicyPlanner(GRPBase):
                 
         elif self.world_model_name == "DreamerV3":
             h, z = initial_state["h"], initial_state['z']
-            state = torch.cat((h, z), dim=1)
+            state = torch.cat((z, h), dim=1)
             
 
         action_pred = self.policy_model(state)
         action_mean, action_std = torch.split(action_pred, split_size_or_sections=self.action_dim, dim=-1)
-        action_var = torch.exp(2 * action_std)
 
         best_actions, best_reward = self.cem_planner.plan(
             initial_state=initial_state, 
             return_best_sequence=return_best_sequence,
             init_mean=action_mean, 
-            init_std=action_var   
+            init_std=torch.exp(action_std) # output of network is log-std, convert back to std
         )
         return best_actions, best_reward
         
@@ -457,16 +457,17 @@ class PolicyPlanner(GRPBase):
         ## Encode observations, roll through RSSM, and plan with policy from current state
         B, T = observations.shape[0], observations.shape[1]
         device = observations.device
+        world_model = self.cem_planner.world_model
         
         if prev_state is None: 
-            prev_state = self.world_model.get_initial_state(B, device)
+            prev_state = world_model.get_initial_state(B, device)
         
         for t in range(T):
             obs_t = observations[:, t].permute(0, 3, 1, 2)
-            emb_t = self.world_model.encoder(obs_t) # (B, embed_dim)
-            action_t = prev_actions[:, t]
+            emb_t = world_model.encoder(obs_t) # (B, embed_dim)
+            action_t = prev_actions[:, t] if prev_actions is not None else torch.zeros((B, self.action_dim), device=device)
             
-            prev_state = self.world_model.rssm_step(prev_state, action_t, emb_t)
+            prev_state = world_model.rssm_step(prev_state, action_t, emb_t)
             
         best_actions, best_reward = self.plan(prev_state, return_best_sequence=True)
         

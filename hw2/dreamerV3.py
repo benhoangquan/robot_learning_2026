@@ -1,5 +1,3 @@
-from tensorflow.python.ops.gen_batch_ops import batch
-from networkx import kneser_graph
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -156,15 +154,19 @@ class DreamerV3(GRPBase):
                 C, H, W = obs_shape
                 out_dim = lambda w, k, p, s: (w - k + 2 * p) // s + 1
                 
-                out1 = out_dim(max(H, W), kernel_size, 0, stride)
-                out2 = out_dim(out1, kernel_size, 0, stride)
-                out3 = out_dim(out2, kernel_size, 0, stride)
+                h_out = out_dim(H, kernel_size, 0, stride)
+                h_out = out_dim(h_out, kernel_size, 0, stride)
+                h_out = out_dim(h_out, kernel_size, 0, stride)
+                
+                w_out = out_dim(W, kernel_size, 0, stride)
+                w_out = out_dim(w_out, kernel_size, 0, stride)
+                w_out = out_dim(w_out, kernel_size, 0, stride)
                 
                 self.conv1 = nn.Conv2d(C, 32, kernel_size, stride)
                 self.conv2 = nn.Conv2d(32, 64, kernel_size, stride)
                 self.conv3 = nn.Conv2d(64, 128, kernel_size, stride)
                 self.flatten = nn.Flatten(1)
-                self.fc = nn.Linear(128 * out3 * out3, embed_dim)
+                self.fc = nn.Linear(128 * h_out * w_out, embed_dim)
             
             def forward(self, x):
                 x = F.relu(self.conv1(x))
@@ -190,11 +192,10 @@ class DreamerV3(GRPBase):
                 self.conv2t = nn.ConvTranspose2d(64, 32, kernel_size, stride, padding=1)  
                 self.conv3t = nn.ConvTranspose2d(32, 16, kernel_size, stride, padding=1) 
                 self.conv4t = nn.ConvTranspose2d(16, 8, kernel_size, stride, padding=1)  
-                self.conv5t = nn.ConvTranspose2d(8, 4, kernel_size, stride, padding=1)     
+                self.conv5t = nn.ConvTranspose2d(8, C, kernel_size, stride, padding=1)     
                 self.tanh = nn.Tanh()
                 
             def forward(self, x):
-                import torch.nn.functional as F
                 B = x.shape[0]
                 x = self.fc(x)
                 x = torch.reshape(x, (B, 128, 4, 4))
@@ -252,7 +253,10 @@ class DreamerV3(GRPBase):
         # Output arg_max = (B, stoch_dim)
         # Output one_hot = (B, stoch_dim, discrete_dim)
         z_soft = F.softmax(logits, dim=-1)
-        z_hard = F.one_hot(torch.argmax(logits, dim=-1), num_classes = self.discrete_dim).float()
+        z_hard = F.one_hot(
+            torch.distributions.Categorical(logits=logits).sample(),
+            num_classes=self.discrete_dim
+        ).float()
     
         # reshape because h_t have shape (B, self.deter_dim)
         if not training:
@@ -264,10 +268,10 @@ class DreamerV3(GRPBase):
     def rssm_step(self, prev_state, action, embed=None):
         # TODO: Part 3.1 - Implement RSSM step
         ## Update deterministic state (h) with GRU, compute prior and posterior distributions
-        # Input: prev_state = {"h", "z", "z_prob"} (from get_init) , action = a_prev = (B, action_dim), embed (for postMLP) = (B, embed_dim)
+        # Input: prev_state = {"h", "z", "z_probs"} (from get_init) , action = a_prev = (B, action_dim), embed (for postMLP) = (B, embed_dim)
         # Prior input = h_prev; Post input = concat(h_prev, embed)
         h_prev, z_prev = prev_state["h"], prev_state["z"]
-        x_prev = torch.concat((z_prev, action), dim=-1)
+        x_prev = torch.cat((z_prev, action), dim=-1)
         
         # Input GRU: concat(z_prev, a_prev), h_prev
         # Input GRU = (B, seq_len, input_size) => x_prev = (B, input_size), x_prev.unsqueeze(1) to add time dim
@@ -282,18 +286,18 @@ class DreamerV3(GRPBase):
             # Imagination/no observation case
             post_logit = prior_logit
         else: 
-            post_input = torch.concat((h_cur, embed), dim=-1)
+            post_input = torch.cat((h_cur, embed), dim=-1)
             post_logit = self.postMLP(post_input)
         
         # self.training is from nn.Module, = True on calling train()
         z_cur = self.sample_stochastic(post_logit, training=self.training)
-        z_prob = F.softmax(torch.reshape(post_logit, (-1, self.stoch_dim, self.discrete_dim)), dim=-1)
+        z_probs = F.softmax(torch.reshape(post_logit, (-1, self.stoch_dim, self.discrete_dim)), dim=-1)
         return {
             "h": h_cur, 
             "z": z_cur,
             "post_logit": post_logit, 
             "prior_logit": prior_logit, 
-            "z_prob": z_prob
+            "z_probs": z_probs
         }
 
     def forward(self, observations, prev_actions=None, prev_state=None,
@@ -314,7 +318,7 @@ class DreamerV3(GRPBase):
         
         for t in range(T):
             obs = torch.permute(observations[:, t], (0, 3, 1, 2))
-            action = prev_actions[:, t]
+            action = prev_actions[:, t] if prev_actions is not None else torch.zeros((B, self.action_dim), device=device)
             embd_obs = self.encoder(obs)
             # reset at the beginning of the loop
             prev_state = self.rssm_step(prev_state, action, embd_obs)
