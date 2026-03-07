@@ -83,58 +83,55 @@ class CEMPlanner(Planner):
 
         # Random actions samples and scale to normalize to -1, 1
         # variable name with s with more than 1 samples
+        device = next(self.world_model.parameters()).device
+        
+        best_id = torch.tensor(0, device=device)
+        actions = torch.zeros((self.num_samples, self.horizon, self.action_dim), device=device)
 
+        if init_mean is None: 
+            mean_actions = torch.zeros(self.horizon, self.action_dim, device=device)
+        else: 
+            mean_actions = init_mean.reshape(self.action_dim).unsqueeze(0).expand(self.horizon, -1).contiguous()
+            
+        if init_std is None: 
+            std_actions = torch.ones(self.horizon, self.action_dim, device=device)
+        else: 
+            std_actions = init_std.reshape(self.action_dim).unsqueeze(0).expand(self.horizon, -1).contiguous()
 
         # TODO if state/pose dim = (B, T, pose_dim)
-        if isinstance(self.world_model, SimpleWorldModel):
+        # Before, this use to be in a if clause to switch between Dreamer and Simple
+        # but _evaluate_sequences already taking care of switching model 
+        for _ in range(self.num_iterations):
+            # # distribution sampling slow!
+            # actions = [torch.normal(mean_actions, std_actions, device=device) for _ in range(self.num_samples)]
+            # actions = torch.stack(actions)
+            
+            # Vectorized Sampling
+            # N = num_samples, H = horizon, A = action_dim
+            mean = mean_actions.unsqueeze(0).expand(self.num_samples, -1, -1)  # (N, H, A)
+            std  = std_actions.unsqueeze(0).expand(self.num_samples, -1, -1)   # (N, H, A)
+            actions = torch.normal(mean, std)  # (N, H, A)
+            
+            # Normalized actions
+            actions = actions.clamp(-1.0, 1.0)
+            
+            # eval seqs
+            rewards = self._evaluate_sequences(initial_state, actions)
 
-            pose = initial_state["pose"]
-            device = pose.device
-            best_id = torch.tensor(0, device=device)
-            actions = torch.zeros((self.num_samples, self.horizon, self.action_dim), device=device)
+            # update mean/std from the elites
+            # choose n actions sequences that have the highest rewards (arg max?) then calculate mean/std from that
+            _, idx = torch.topk(rewards, k=self.num_elites)
+            best_id = torch.argmax(rewards)
+            elites = actions[idx]
+            mean_actions = elites.mean(dim=0)
+            std_actions = elites.std(dim=0) + 1e-6
 
-            if init_mean is None: 
-                mean_actions = torch.zeros(self.horizon, self.action_dim, device=device)
-            else: 
-                mean_actions = init_mean.reshape(self.action_dim).expand(self.horizon, -1).contiguous()
-                
-            if init_std is None: 
-                std_actions = torch.ones(self.horizon, self.action_dim, device=device)
-            else: 
-                std_actions = init_std.reshape(self.action_dim).expand(self.horizon, -1).contiguous()
+        # return top action/action mean and top reward/reward mean
+        if return_best_sequence: 
+            return actions[best_id], rewards[best_id].item()
+        else: 
+            return mean_actions, float(rewards.mean())
 
-            for _ in range(self.num_iterations):
-                # # distribution sampling slow!
-                # actions = [torch.normal(mean_actions, std_actions, device=device) for _ in range(self.num_samples)]
-                # actions = torch.stack(actions)
-                
-                # Vectorized Sampling
-                # N = num_samples, H = horizon, A = action_dim
-                mean = mean_actions.unsqueeze(0).expand(self.num_samples, -1, -1)  # (N, H, A)
-                std  = std_actions.unsqueeze(0).expand(self.num_samples, -1, -1)   # (N, H, A)
-                actions = torch.normal(mean, std)  # (N, H, A)
-                
-                # Normalized actions
-                actions = actions.clamp(-1.0, 1.0)
-                
-                # eval seqs
-                rewards = self._evaluate_sequences(initial_state, actions)
-
-                # update mean/std from the elites
-                # choose n actions sequences that have the highest rewards (arg max?) then calculate mean/std from that
-                _, idx = torch.topk(rewards, k=self.num_elites)
-                best_id = torch.argmax(rewards)
-                elites = actions[idx]
-                mean_actions = elites.mean(dim=0)
-                std_actions = elites.std(dim=0) + 1e-6
-
-            # return top action/action mean and top reward/reward mean
-            if return_best_sequence: 
-                return actions[best_id], rewards[best_id].item()
-            else: 
-                return mean_actions, float(rewards.mean())
-
- 
     def _evaluate_sequences(self, initial_state, action_sequences):
         """
         Evaluate a batch of action sequences by rolling them out in the world model.
@@ -159,7 +156,25 @@ class CEMPlanner(Planner):
         """
         # TODO: Part 3.3 - Implement CEM planning with DreamerV3
         ## Roll out action sequences in the DreamerV3 world model and compute total rewards
-        pass
+        B, T = self.num_samples, self.horizon
+        
+        # initial_state will have only 1 h and 1 z so we need to expand that 
+        state = initial_state
+        state['h'] = state['h'].expand(B, -1)
+        state['z'] = state['z'].expand(B, -1)
+        
+        cumul_rewards = torch.zeros(B, 1)
+        
+        # no forward pass here, fwd pass for training
+        # in inference, we use prior logit instead of post logit
+        # we don't care about decoder head and continues head, choose only rewards head
+        for t in range(T):
+            action = action_sequences[:, t]
+            state = self.world_model.rssm_step(state, action, embed=None)
+            x = torch.cat((state["h"], state['z']), dim=1)
+            reward = self.world_model.rewardMLP(x)
+            cumul_rewards += reward
+        return cumul_rewards.squeeze(-1)
     
     def _evaluate_sequences_simple(self, initial_state, action_sequences):
         """
@@ -243,8 +258,8 @@ class CEMPlanner(Planner):
         if pose is None:
             raise ValueError("CEMPlanner with SimpleWorldModel requires pose.")
         # pose: (B, pose_dim), often B=1
-        initial_state = {"pose": pose}
-        best_actions, best_reward = self.plan(initial_state, return_best_sequence=True)
+        state = {"pose": pose}
+        best_actions, best_reward = self.plan(state, return_best_sequence=True)
         # best_actions: (horizon, action_dim), best_reward: float
         if return_full_sequence:
             actions = best_actions.unsqueeze(0)  # (1, horizon, action_dim)
@@ -254,14 +269,39 @@ class CEMPlanner(Planner):
         return {
             "actions": actions,
             "predicted_reward": reward_val,
-            "final_state": initial_state,
+            "final_state": state,
         }
     
     def _forward_dreamer(self, observations, prev_actions, prev_state, return_full_sequence):
         """Forward pass for DreamerV3 model."""
         # TODO: Part 4.2 - Implement DreamerV3 forward pass for policy
         ## Encode observations, roll through RSSM, and plan with policy from current state
-        pass
+        # Preprocess observations 
+        B, T = observations.shape[0], observations.shape[1]
+        device = observations.device
+        
+        if prev_state is None: 
+            prev_state = self.world_model.get_initial_state(B, device)
+        
+        for t in range(T):
+            obs_t = observations[:, t].permute(0, 3, 1, 2)
+            emb_t = self.world_model.encoder(obs_t) # (B, embed_dim)
+            action_t = prev_actions[:, t]
+            
+            prev_state = self.world_model.rssm_step(prev_state, action_t, emb_t)
+            
+        best_actions, best_reward = self.plan(prev_state, return_best_sequence=True)
+        
+        if return_full_sequence:
+            actions = best_actions.unsqueeze(0)  # (1, horizon, action_dim)
+        else:
+            actions = best_actions[0:1]         # (1, action_dim) — first step only
+        reward_val = best_reward if isinstance(best_reward, float) else best_reward.item()
+        return {
+            "actions": actions,
+            "predicted_reward": reward_val,
+            "final_state": prev_state,
+        }
     
     def preprocess_state(self, image):
         """
@@ -356,20 +396,26 @@ class PolicyPlanner(GRPBase):
         # TODO: Part 2.2 - Implement policy rollout planning
         ## Roll out the policy over the horizon, predicting actions and accumulating rewards
         if self.world_model_name == "SimpleWorldModel":
-            initial_pose = initial_state['pose']
-            if initial_pose.dim() == 1:
-                initial_pose = initial_pose.unsqueeze(0)  # ensure (1, 7)
-            action_pred = self.policy_model(initial_pose)
-            action_mean, action_std = torch.split(action_pred, split_size_or_sections=self.action_dim, dim=-1)
-            action_var = torch.exp(2 * action_std)
+            state = initial_state['pose']
+            if state.dim() == 1:
+                state = state.unsqueeze(0)  # ensure (1, 7)
+                
+        elif self.world_model_name == "DreamerV3":
+            h, z = initial_state["h"], initial_state['z']
+            state = torch.cat((h, z), dim=1)
+            
 
-            best_actions, best_reward = self.cem_planner.plan(
-                initial_state=initial_state, 
-                return_best_sequence=return_best_sequence,
-                init_mean=action_mean, 
-                init_std=action_var   
-            )
-            return best_actions, best_reward
+        action_pred = self.policy_model(state)
+        action_mean, action_std = torch.split(action_pred, split_size_or_sections=self.action_dim, dim=-1)
+        action_var = torch.exp(2 * action_std)
+
+        best_actions, best_reward = self.cem_planner.plan(
+            initial_state=initial_state, 
+            return_best_sequence=return_best_sequence,
+            init_mean=action_mean, 
+            init_std=action_var   
+        )
+        return best_actions, best_reward
         
     def forward(self, observations=None, prev_actions=None, prev_state=None,
                 mask_=True, pose=None, last_action=None,
@@ -409,7 +455,32 @@ class PolicyPlanner(GRPBase):
         """Forward pass for DreamerV3 model."""
         # TODO: Part 4.2 - Implement DreamerV3 forward pass for policy
         ## Encode observations, roll through RSSM, and plan with policy from current state
-        pass
+        B, T = observations.shape[0], observations.shape[1]
+        device = observations.device
+        
+        if prev_state is None: 
+            prev_state = self.world_model.get_initial_state(B, device)
+        
+        for t in range(T):
+            obs_t = observations[:, t].permute(0, 3, 1, 2)
+            emb_t = self.world_model.encoder(obs_t) # (B, embed_dim)
+            action_t = prev_actions[:, t]
+            
+            prev_state = self.world_model.rssm_step(prev_state, action_t, emb_t)
+            
+        best_actions, best_reward = self.plan(prev_state, return_best_sequence=True)
+        
+        if return_full_sequence:
+            actions = best_actions.unsqueeze(0)  # (1, horizon, action_dim)
+        else:
+            actions = best_actions[0:1]         # (1, action_dim) — first step only
+        reward_val = best_reward if isinstance(best_reward, float) else best_reward.item()
+        return {
+            "actions": actions,
+            "predicted_reward": reward_val,
+            "final_state": prev_state,
+        }
+
     
     def _forward_simple(self, pose, return_full_sequence):
         """Forward pass for SimpleWorldModel."""
