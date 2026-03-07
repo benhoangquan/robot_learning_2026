@@ -14,7 +14,6 @@ LIBERO/
 SimplerEnv/
 .vscode/
 .venv/
-.cursor
 .libero
 .lightning_studio
 .netrc
