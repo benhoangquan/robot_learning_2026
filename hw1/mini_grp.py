@@ -48,8 +48,6 @@ def my_main(cfg: DictConfig):
     tokenizer = None
     text_model = None
     if cfg.dataset.encode_with_t5: ## Load T5 model
-        # TODO:    
-        # Load the t5 model and tokenizer
         tokenizer = AutoTokenizer.from_pretrained("t5-small")
         text_model = AutoModelForSeq2SeqLM.from_pretrained("t5-small")
         text_model.eval()
@@ -63,7 +61,7 @@ def my_main(cfg: DictConfig):
         from grp_convnet import estimate_loss
         model = GRPConvNet(cfg)
         print(f"Using ConvNet model")
-    if cfg.model.type == "dense":
+    elif cfg.model.type == "dense":
         from grp_convnet import PoseOnlyNet
         from grp_convnet import estimate_loss
         model = PoseOnlyNet(cfg)
@@ -134,7 +132,7 @@ def my_main(cfg: DictConfig):
             torch.save(model, path_, pickle_module=dill) ## serialize class objects as well.
             ## Save the grp_model.py file into the output folder as well
             import shutil
-            shutil.copy(hydra.utils.get_original_cwd()+"/mini-grp/grp_model.py", log_dir)
+            shutil.copy(hydra.utils.get_original_cwd()+"/hw1/grp_model.py", log_dir)
             print("Model saved to " + path_)
         
         if cfg.simEval and (iter % cfg.eval_vid_iters == 0) and (iter !=0): ## Do this eval infrequently because it takes a fiar bit of compute

@@ -383,7 +383,7 @@ def my_main(cfg: DictConfig):
     cfg.dataset.load_dataset = "skip"
     # model = GRP(cfg)
     # model_ = torch.load("/home/gberseth/playground/mini_grp/miniGRP.pth")
-    model_dir = hydra.utils.get_original_cwd()+"/mini-grp/miniGRP.pth"
+    model_dir = hydra.utils.get_original_cwd()+"/hw1/miniGRP.pth"
     print ("Loading model from:", model_dir)
     if "dataset" == cfg.model.type:
         ## load the dataset

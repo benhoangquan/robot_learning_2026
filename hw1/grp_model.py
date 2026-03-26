@@ -2,6 +2,8 @@ import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
+from einops.layers.torch import Rearrange
+from einops import repeat
 
 
 def get_patches_fast(images, cfg):
@@ -36,8 +38,6 @@ class Head(nn.Module):
 
     def forward(self, x, mask=None):
         B,T,C = x.shape
-        # TODO: 
-        ## Provide the block masking logic for the attention head
         if mask is None: 
             mask = torch.ones(T, device=x.device, dtype=torch.bool)
         else: 
@@ -173,9 +173,16 @@ class GRP(nn.Module):
         # ------------------------------------------------------------------
         # 6) Action head: map CLS embedding -> action vector
         # ------------------------------------------------------------------
-        self.action_head = nn.Linear(
-            cfg.n_embd, cfg.action_dim * cfg.policy.action_stacking
-        )
+        self.use_discrete_actions = getattr(cfg.policy, 'use_discrete_actions', False)
+        if self.use_discrete_actions:
+            # 14 bins per action dimension
+            self.mlp_head = nn.Linear(
+                cfg.n_embd, cfg.action_dim * cfg.policy.action_stacking * 14
+            )
+        else:
+            self.mlp_head = nn.Linear(
+                cfg.n_embd, cfg.action_dim * cfg.policy.action_stacking
+            )
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -280,13 +287,25 @@ class GRP(nn.Module):
         # 9) Classification token and action head
         # ------------------------------------------------------------------
         cls_output = tokens[:, 0, :]           # [B, n_embd]
-        out = self.action_head(cls_output)     # [B, action_dim * action_stacking]
+        out = self.mlp_head(cls_output)     # [B, action_dim * action_stacking]
 
         # ------------------------------------------------------------------
         # 10) Loss (continuous actions by default, using MSE)
         # ------------------------------------------------------------------
         if targets is not None:
-            loss = F.mse_loss(out, targets)
+            if self.use_discrete_actions:
+                # out: [B, action_dim * action_stacking * 14]
+                # targets: [B, action_dim * action_stacking] (continuous)
+                # Reshape out to [B, action_dim * action_stacking, 14]
+                B_size = out.shape[0]
+                logits = out.view(B_size, -1, 14)
+                # Bin targets: map continuous targets to discrete indices [0, 13]
+                # We use linspace between -2 and 2 to cover most standardized action values
+                bins = torch.linspace(-2, 2, 13).to(targets.device)
+                target_bins = torch.bucketize(targets, bins) # Returns indices 0 to 13
+                loss = F.cross_entropy(logits.reshape(-1, 14), target_bins.reshape(-1))
+            else:
+                loss = F.mse_loss(out, targets)
         else:
             loss = torch.tensor(0.0, device=out.device)
 
@@ -341,9 +360,16 @@ class GRP(nn.Module):
         if self._cfg.dataset.encode_with_t5:
             if tokenizer is None or text_model is None:
                 raise ValueError("tokenizer and text_model must be provided when using T5 encoding")
-            # TODO:    
-            ## Provide the logic converting text goal to T5 embedding tensor
-            pass
+            
+            input_ids = tokenizer(goal, return_tensors="pt").input_ids.to(self._cfg.device)
+            with _torch.no_grad():
+                goal_t = text_model.encoder(input_ids).last_hidden_state # [1, T, E]
+            
+            # Pad or truncate to max_block_size
+            goal_e = _torch.zeros((1, self._cfg.max_block_size, self._cfg.n_embd), device=self._cfg.device)
+            T = min(goal_t.size(1), self._cfg.max_block_size)
+            goal_e[0, :T, :] = goal_t[0, :T, :]
+            return goal_e
         else:
             pad = " " * self._cfg.max_block_size
             goal_ = goal[:self._cfg.max_block_size] + pad[len(goal):self._cfg.max_block_size]
@@ -382,14 +408,15 @@ class GRP(nn.Module):
         """Encode actions to normalized space [-1, 1]"""
         import torch as _torch
         ## If the action_float has length greater than action_dim then use stacking otherwise just use normal standardiaztion vectors
-        if action_float.shape[1] == len(self._cfg.dataset.action_mean):
+        if action_float.shape[-1] == len(self._cfg.dataset.action_mean):
             action_mean = _torch.tensor(self._cfg.dataset.action_mean, dtype=action_float.dtype, device=action_float.device)
             action_std = _torch.tensor(self._cfg.dataset.action_std, dtype=action_float.dtype, device=action_float.device)
             return (action_float - action_mean) / (action_std)  
 
-        action_mean = _torch.tensor(np.repeat([self._cfg.dataset.action_mean], self._cfg.policy.action_stacking, axis=0).flatten(), 
+        stacking = action_float.shape[-1] // len(self._cfg.dataset.action_mean)
+        action_mean = _torch.tensor(np.repeat([self._cfg.dataset.action_mean], stacking, axis=0).flatten(), 
                                    dtype=action_float.dtype, device=action_float.device)
-        action_std = _torch.tensor(np.repeat([self._cfg.dataset.action_std], self._cfg.policy.action_stacking, axis=0).flatten(), 
+        action_std = _torch.tensor(np.repeat([self._cfg.dataset.action_std], stacking, axis=0).flatten(), 
                                   dtype=action_float.dtype, device=action_float.device)
         return (action_float - action_mean) / (action_std)
     
@@ -418,6 +445,13 @@ class GRP(nn.Module):
         state_mean = _torch.tensor(self._cfg.dataset.state_mean, dtype=state_float.dtype, device=state_float.device)
         state_std = _torch.tensor(self._cfg.dataset.state_std, dtype=state_float.dtype, device=state_float.device)
         return (state_float - state_mean) / (state_std)
+
+    def encode_pose(self, pose_float):
+        """Encode robot pose to normalized space"""
+        import torch as _torch
+        pose_mean = _torch.tensor(self._cfg.dataset.pose_mean, dtype=pose_float.dtype, device=pose_float.device)
+        pose_std = _torch.tensor(self._cfg.dataset.pose_std, dtype=pose_float.dtype, device=pose_float.device)
+        return (pose_float - pose_mean) / (pose_std)
 
 
 @torch.no_grad()

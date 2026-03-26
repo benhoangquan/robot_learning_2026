@@ -324,8 +324,15 @@ class CircularBuffer:
         ## Make goal embeddings of a fixed length and fill in the earlier chunks with the true goal data
         if self._cfg.dataset.encode_with_t5:
             if language_instruction is not None:
-                ##TODO: This does not work if the original language instrictuion size is less than the new max_block_size
-                self._dataset_tmp["t5_language_embedding"][self._index] = torch.tensor(language_instruction[:self._cfg.max_block_size], dtype=torch.float, device=self._cfg.device)
+                # Handle padding/truncation to max_block_size
+                emb = torch.tensor(language_instruction, dtype=torch.float, device=self._cfg.device)
+                if emb.size(0) > self._cfg.max_block_size:
+                    emb = emb[:self._cfg.max_block_size]
+                elif emb.size(0) < self._cfg.max_block_size:
+                    padding = torch.zeros((self._cfg.max_block_size - emb.size(0), emb.size(1)), 
+                                        dtype=torch.float, device=self._cfg.device)
+                    emb = torch.cat([emb, padding], dim=0)
+                self._dataset_tmp["t5_language_embedding"][self._index] = emb
             else:
                 with torch.profiler.record_function("Process goal text with T5"):
                     goal_ = self._model.process_text_embedding_for_buffer(goal, tokenizer=self._tokenizer, text_model=self._text_model)
@@ -388,15 +395,18 @@ class CircularBuffer:
         x_goal_img = self._model.normalize_state(transform_crop_scale(data["goal_img"][ix].to(torch.float))) ## [B, C, H,  W]
         x_goal_img = x_goal_img # Convert to [B, H, W, C] format from torchvision.
     
-        # TODO: 
-        ## Provide the block masking logic for the attention head
-        y = 0 ## discrete or continuous actions
+        # Target action: potentially stacked.
+        y_list = []
+        for i in range(cfg.policy.action_stacking):
+            y_list.append(data["action"][ix + i])
+        y = torch.cat(y_list, dim=-1) # [B, action_dim * action_stacking]
+        y = self._model.encode_action(y)
         
         # Get last action (action at timestep before current observation)
         ## Zero out the last action if ix == 0
-        row_mask = torch.logical_and(ix > 0, (data["terminated"][ix - 1][:,0] - 1) * -1) # if the previous step was terminated, we also zero out the last action
-        last_action = torch.zeros_like(y[:, :cfg.action_dim])
-        last_action[row_mask] = data["action"][ix - 1][row_mask]
+        row_mask = torch.logical_and(ix > 0, (data["terminated"][ix - 1][:,0].to(torch.float32) - 1) * -1 > 0) # if the previous step was terminated, we also zero out the last action
+        last_action = torch.zeros((batch_size, cfg.action_dim), dtype=torch.float32, device=cfg.device)
+        last_action[row_mask] = data["action"][ix[row_mask] - 1]
         last_action = self._model.encode_action(last_action)
         # last_action = self._model.encode_action(data["action"][ix - 1]) if ix > 0 else torch.zeros_like(y[:, :cfg.action_dim])
         ## Add noise to the last_action for data augmentation
