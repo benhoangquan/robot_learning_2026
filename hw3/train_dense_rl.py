@@ -30,7 +30,7 @@ from hw3.libero_env_fast import FastLIBEROEnv
 
 
 # ---------------------------------------------------------------------------
-# Policy and value networks
+# Policy (actor) and value networks (critic)
 # ---------------------------------------------------------------------------
 
 class DensePolicy(nn.Module):
@@ -41,7 +41,19 @@ class DensePolicy(nn.Module):
     def __init__(self, obs_dim: int, action_dim: int, hidden_dim: int = 256, n_layers: int = 3):
         super().__init__()
         # TODO: Build the policy network layers and output heads.
-        pass
+        self.obs_dim = obs_dim
+        self.action_dim = action_dim
+        self.hidden_dim = hidden_dim
+        self.n_layers = n_layers
+        
+        self.activation = nn.ReLU
+        self.input = nn.Linear(obs_dim, hidden_dim)
+        self.layers = nn.ModuleList()
+        for i in range(n_layers):
+            self.layers.append(nn.Linear(hidden_dim, hidden_dim))
+        self.action_mean_head = nn.Linear(hidden_dim, action_dim)
+        self.action_std_head = nn.Linear(hidden_dim, action_dim)
+        
 
     def forward(self, obs: torch.Tensor):
         """
@@ -51,7 +63,12 @@ class DensePolicy(nn.Module):
             dist: torch.distributions.Normal over actions
         """
         # TODO: Return a Normal distribution over actions given obs.
-        pass
+        x = self.input(obs)
+        for layer in self.layers: 
+            x = self.activation(layer(x))
+        mean = self.action_mean_head(x)
+        std = self.action_std_head(x)
+        return torch.normal(mean=mean, std=std)
 
     def get_action(self, obs: torch.Tensor, deterministic: bool = False):
         """Sample an action and return (action, log_prob, entropy)."""
@@ -71,7 +88,11 @@ class DenseValueFunction(nn.Module):
     def __init__(self, obs_dim: int, hidden_dim: int = 256, n_layers: int = 3):
         super().__init__()
         # TODO: Build the value network layers.
-        pass
+        layers = [nn.Linear(obs_dim, hidden_dim), nn.ReLU()]
+        for _ in range(n_layers):
+            layers += [nn.Linear(hidden_dim, hidden_dim), nn.ReLU()]
+        self.net = nn.Sequential(*layers)
+        self.value_head = nn.Linear(hidden_dim, 1)        
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         """Returns scalar value estimate of shape (B,)."""
@@ -126,7 +147,21 @@ class RolloutBuffer:
         # TODO: Compute GAE advantages and discounted returns.
         returns = torch.zeros_like(self.rewards)
         advantages = torch.zeros_like(self.rewards)
-        pass
+
+        # Backward recursion for GAE:
+        # delta_t = r_t + gamma * V(s_{t+1}) * (1 - done_t) - V(s_t)
+        # gae_t = delta_t + gamma * gae_lambda * (1 - done_t) * gae_{t+1}
+        gae = torch.zeros((), device=self.device, dtype=self.rewards.dtype)
+
+        for t in reversed(range(self.rollout_length)):
+            next_value = last_value if t == self.rollout_length - 1 else self.values[t + 1]
+            non_terminal = 1.0 - self.dones[t]
+            delta = self.rewards[t] + gamma * next_value * non_terminal - self.values[t]
+            gae = delta + gamma * gae_lambda * non_terminal * gae
+            advantages[t] = gae
+            returns[t] = advantages[t] + self.values[t]
+
+        return returns, advantages
 
 
 # ---------------------------------------------------------------------------
@@ -145,8 +180,76 @@ def ppo_update(policy: DensePolicy,
 
     Returns a dict of mean losses for logging.
     """
-    # TODO: Implement PPO minibatch updates over ppo_epochs.
-    return {}
+    obs = buffer.obs
+    actions = buffer.actions
+    old_log_probs = buffer.log_probs
+    advantages = advantages.detach()
+    returns = returns.detach()
+
+    if cfg.training.normalize_advantages:
+        advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
+
+    num_samples = buffer.ptr
+    minibatch_size = min(cfg.training.minibatch_size, num_samples)
+    clip_eps = cfg.training.clip_eps
+    value_coeff = cfg.training.value_coeff
+    entropy_coeff = cfg.training.entropy_coeff
+    max_grad_norm = cfg.training.max_grad_norm
+
+    stats = {
+        "policy_loss": 0.0,
+        "value_loss": 0.0,
+        "entropy": 0.0,
+        "approx_kl": 0.0,
+        "clip_fraction": 0.0,
+    }
+    num_updates = 0
+
+    params = list(policy.parameters()) + list(value_fn.parameters())
+
+    for _ in range(cfg.training.ppo_epochs):
+        permutation = torch.randperm(num_samples, device=obs.device)
+        for start in range(0, num_samples, minibatch_size):
+            idx = permutation[start:start + minibatch_size]
+            batch_obs = obs[idx]
+            batch_actions = actions[idx]
+            batch_returns = returns[idx]
+            batch_advantages = advantages[idx]
+            batch_old_log_probs = old_log_probs[idx]
+
+            dist = policy.forward(batch_obs)
+            new_log_probs = dist.log_prob(batch_actions).sum(-1)
+            entropy = dist.entropy().sum(-1).mean()
+            values = value_fn(batch_obs)
+
+            ratio = (new_log_probs - batch_old_log_probs).exp()
+            clipped_ratio = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps)
+            policy_loss = -(torch.min(ratio * batch_advantages, clipped_ratio * batch_advantages)).mean()
+
+            value_loss = F.mse_loss(values, batch_returns)
+
+            loss = policy_loss + value_coeff * value_loss - entropy_coeff * entropy
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            nn.utils.clip_grad_norm_(params, max_grad_norm)
+            optimizer.step()
+
+            with torch.no_grad():
+                approx_kl = (batch_old_log_probs - new_log_probs).mean()
+                clip_fraction = (torch.abs(ratio - 1.0) > clip_eps).float().mean()
+
+            stats["policy_loss"] += policy_loss.item()
+            stats["value_loss"] += value_loss.item()
+            stats["entropy"] += entropy.item()
+            stats["approx_kl"] += approx_kl.item()
+            stats["clip_fraction"] += clip_fraction.item()
+            num_updates += 1
+
+    for k in stats:
+        stats[k] /= max(1, num_updates)
+
+    return stats
 
 
 # ---------------------------------------------------------------------------
