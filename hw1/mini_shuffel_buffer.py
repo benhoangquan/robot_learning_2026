@@ -18,6 +18,44 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 size = 20 * 1024 * 1024 * 1024
 os.environ["HF_DATASETS_IN_MEMORY_MAX_SIZE"] = str(size)
 
+
+def _dataset_use_init_state(cfg) -> bool:
+    """Teacher configs may omit dataset.use_init_state; default to False (struct-safe)."""
+    return bool(OmegaConf.select(cfg, "dataset.use_init_state", default=False))
+
+
+def _dataset_recompute_normalizations(cfg) -> bool:
+    """Teacher configs may omit dataset.recompute_normalizations; default to False (struct-safe)."""
+    return bool(OmegaConf.select(cfg, "dataset.recompute_normalizations", default=False))
+
+
+def _hf_terminated_slice(dataset, buffer_size):
+    """Load step termination flags; teacher datasets may omit ``terminated`` (use ``done`` or zeros)."""
+    buf = buffer_size
+    if "terminated" in dataset.column_names:
+        return dataset["terminated"][:buf]
+    if "done" in dataset.column_names:
+        return dataset["done"][:buf]
+    n = min(len(dataset), buf)
+    return [0] * n
+
+
+def _pose_buffer_dim(cfg) -> int:
+    """Fallback width when we cannot peek HF pose (non-HF loaders)."""
+    return max(len(cfg.dataset.action_std), len(cfg.dataset.action_mean), 7)
+
+
+def _canonical_pose_vector(pose) -> np.ndarray:
+    """8+ raw dims -> 7D bridge layout; 6–7D tensors are left flat (already eef)."""
+    p = np.asarray(pose, dtype=np.float32).ravel()
+    if p.size >= 8:
+        return np.concatenate([p[2:5], p[5:8], p[:1]])
+    return p
+
+
+def _pose_feature_dim_from_raw(pose_sample) -> int:
+    return int(_canonical_pose_vector(pose_sample).size)
+
 # def apply_transforms(episode, cfg, dataset_name):
 #     """
 #     Apply the necessary transforms to the episode data.
@@ -194,9 +232,23 @@ class CircularBuffer:
         self._model = model
         self._index = 0
         self._count = 0
-        
-        self._dataset_tmp = self.update_internal_dataset(size, old_data=None) 
-                    
+
+        preloaded_hf = None
+        pose_buf_dim = _pose_buffer_dim(cfg)
+        if cfg.dataset.load_dataset is True:
+            import datasets
+
+            _hf_t0 = time.time()
+            preloaded_hf = datasets.load_dataset(
+                cfg.dataset.to_name,
+                split="train[:{}]".format(cfg.dataset.buffer_size),
+                keep_in_memory=True,
+            )
+            print("Time to load huggingface dataset:", time.time() - _hf_t0)
+            pose_buf_dim = _pose_feature_dim_from_raw(preloaded_hf["pose"][0])
+
+        self._dataset_tmp = self.update_internal_dataset(size, old_data=None, pose_dim=pose_buf_dim)
+
         if self._cfg.dataset.encode_with_t5:
             self._tokenizer = T5Tokenizer.from_pretrained(self._cfg.dataset.t5_version)
             self._text_model = T5ForConditionalGeneration.from_pretrained(self._cfg.dataset.t5_version)
@@ -222,14 +274,9 @@ class CircularBuffer:
         self._dataset_indicies = self._cfg.dataset.dataset_indicies
         start_ = time.time()
         if self._cfg.dataset.load_dataset is True:
-            # Load the dataset from a file
-            import datasets
-            # with torch.profiler.record_function("Load huggingface dataset"):
+            # Dataset was loaded in __init__ to size the pose buffer from the first row.
             start__ = time.time()
-            ## Load huggingface dataset into memory
-            ## Only load first 200 samples for debugging
-            dataset = datasets.load_dataset(self._cfg.dataset.to_name, split='train[:{}]'.format(self._cfg.dataset.buffer_size), keep_in_memory=True)
-            print("Time to load huggingface dataset:", time.time() - start_)
+            dataset = preloaded_hf
             dataset_tmp = {
                 "img": dataset["img"][:self._cfg.dataset.buffer_size], ## Some loading optimizations to improve debugging
                 "action": dataset["action"][:self._cfg.dataset.buffer_size],
@@ -237,7 +284,7 @@ class CircularBuffer:
                 "goal_text_full": dataset["goal_text_full"][:self._cfg.dataset.buffer_size],
                 "t5_language_embedding": dataset["t5_language_embedding"][:self._cfg.dataset.buffer_size] if self._cfg.dataset.encode_with_t5 else None,
                 "pose": dataset["pose"][:self._cfg.dataset.buffer_size],
-                "terminated": dataset["terminated"][:self._cfg.dataset.buffer_size],
+                "terminated": _hf_terminated_slice(dataset, self._cfg.dataset.buffer_size),
                 "init_state": dataset["init_state"][:self._cfg.dataset.buffer_size] if "init_state" in dataset.column_names else None,
             }
             print("Time to load huggingface data and copy: ", time.time() - start__)
@@ -254,10 +301,10 @@ class CircularBuffer:
                         dataset_tmp["goal_img"][i],
                         language_instruction=dataset_tmp["t5_language_embedding"][i] if self._cfg.dataset.encode_with_t5 else None,
                         terminated=dataset_tmp["terminated"][i],
-                        pose=np.concatenate([pose[2:5], pose[5:8], pose[:1]]),  # Rearranged to match eef pos, eef quat, gripper state
-                        init_state=dataset_tmp["init_state"][i] if "init_state" in dataset_tmp else None,   
+                        pose=_canonical_pose_vector(pose),
+                        init_state=dataset_tmp["init_state"][i] if dataset_tmp.get("init_state") is not None else None,
                         )
-            if self._cfg.dataset.recompute_normalizations:
+            if _dataset_recompute_normalizations(self._cfg):
                 scale = 1.4
                 a_std, a_mean = ((self._dataset_tmp["action"][:self._count]).std(axis=0) + 1e-8) * scale, self._dataset_tmp["action"][:self._count].mean(axis=0)
                 self._cfg.dataset.action_std = [float(x) for x in a_std]
@@ -274,11 +321,15 @@ class CircularBuffer:
             get_multi_dataset_portion(self._builders, self, self._cfg)
             print("Time to load full dataset:", time.time() - start_)
 
-    def update_internal_dataset(self, size, old_data=None):
+    def update_internal_dataset(self, size, old_data=None, pose_dim=None):
         self._size = size
+        if pose_dim is None and old_data is not None and old_data.get("pose") is not None:
+            pose_dim = old_data["pose"].shape[1]
+        if pose_dim is None:
+            pose_dim = _pose_buffer_dim(self._cfg)
         _dataset_tmp = {
                     "img": torch.tensor(np.zeros(shape=(size, self._cfg.image_shape[0], self._cfg.image_shape[0], 3)), dtype=torch.uint8, device=self._cfg.device), 
-                    "pose": torch.tensor(np.zeros(shape=(size, len(self._cfg.dataset.action_std)),), dtype=torch.float, device=self._cfg.device),
+                    "pose": torch.tensor(np.zeros(shape=(size, pose_dim),), dtype=torch.float, device=self._cfg.device),
                     "action": torch.tensor(np.zeros(shape=(size, len(self._cfg.dataset.action_std)),), dtype=torch.float, device=self._cfg.device),
                     "goal": torch.tensor(np.zeros(shape=(size, self._cfg.max_block_size)), dtype=torch.long, device=self._cfg.device), 
                     "goal_text_full": ["" for _ in range(size)], # This is a list of strings, not a tensor
@@ -286,7 +337,7 @@ class CircularBuffer:
                     # "rotation_delta": [], "open_gripper": [] 
                     "t5_language_embedding": torch.tensor(np.zeros(shape=(size, self._cfg.max_block_size, self._cfg.n_embd)), dtype=torch.float, device=self._cfg.device) if self._cfg.dataset.encode_with_t5 else None,
                     "terminated": torch.tensor(np.zeros(shape=(size, 1)), dtype=torch.uint8, device=self._cfg.device),
-                    "init_state": torch.tensor(np.zeros(shape=(size, 92)), dtype=torch.float, device=self._cfg.device) if self._cfg.dataset.use_init_state else None,
+                    "init_state": torch.tensor(np.zeros(shape=(size, 92)), dtype=torch.float, device=self._cfg.device) if _dataset_use_init_state(self._cfg) else None,
                     } 
         if old_data is not None:
             for key in _dataset_tmp:
@@ -395,20 +446,15 @@ class CircularBuffer:
         x_goal_img = self._model.normalize_state(transform_crop_scale(data["goal_img"][ix].to(torch.float))) ## [B, C, H,  W]
         x_goal_img = x_goal_img # Convert to [B, H, W, C] format from torchvision.
     
-        # Target action: potentially stacked.
-        y_list = []
-        for i in range(cfg.policy.action_stacking):
-            y_list.append(data["action"][ix + i])
-        y = torch.cat(y_list, dim=-1) # [B, action_dim * action_stacking]
-        y = self._model.encode_action(y)
-        
-        # Get last action (action at timestep before current observation)
-        ## Zero out the last action if ix == 0
-        row_mask = torch.logical_and(ix > 0, (data["terminated"][ix - 1][:,0].to(torch.float32) - 1) * -1 > 0) # if the previous step was terminated, we also zero out the last action
-        last_action = torch.zeros((batch_size, cfg.action_dim), dtype=torch.float32, device=cfg.device)
-        last_action[row_mask] = data["action"][ix[row_mask] - 1]
+        # Current-step actions (targets), then normalized for the model loss
+        actions = data["action"][ix].to(torch.float32)
+        y = self._model.encode_action(actions)
+
+        # Last action (previous timestep); zero if ix == 0 or previous step was terminal
+        row_mask = torch.logical_and(ix > 0, (data["terminated"][ix - 1][:,0] - 1) * -1)
+        last_action = torch.zeros_like(actions)
+        last_action[row_mask] = data["action"][ix - 1][row_mask]
         last_action = self._model.encode_action(last_action)
-        # last_action = self._model.encode_action(data["action"][ix - 1]) if ix > 0 else torch.zeros_like(y[:, :cfg.action_dim])
         ## Add noise to the last_action for data augmentation
         if cfg.policy.add_noise_to_state:
             noise = torch.randn_like(last_action) * cfg.policy.state_noise_std
@@ -461,7 +507,7 @@ class CircularBuffer:
                 'goal_img': data["goal_img"][i].detach().cpu().numpy(),
                 'pose': data["pose"][i].detach().cpu().numpy(),
                 'terminated': bool(data["terminated"][i].item()),
-                'init_state': data["init_state"][i].detach().cpu().numpy() if self._cfg.dataset.use_init_state else None,
+                'init_state': data["init_state"][i].detach().cpu().numpy() if _dataset_use_init_state(self._cfg) else None,
             }
             
             # Add T5 embedding if available

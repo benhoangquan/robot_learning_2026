@@ -7,6 +7,10 @@ import torch
 import warnings
 warnings.filterwarnings("ignore")
 
+import os
+import sys
+sys.path.append(os.path.join(os.path.dirname(__file__), "../libero"))
+
 def get_text_tokens(cfg, tokenizer, text_model, goal, model=None):
     """
     Get the text tokens/embeddings for the goal.
@@ -104,15 +108,15 @@ def eval_model_in_sim(cfg, model, device, log_dir, env, env_unwrapped,
     episode_stats['rewards'] = np.mean(rewards)
     # print("Episode stats", episode_stats)
     print(f"avg reward {np.mean(episode_stats['rewards']):.8f}")
-    if not cfg.testing:
+    if wandb is not None and not cfg.testing:
         wandb.log({"avg reward": np.mean(rewards)})
-    
+
     import os
     path_ = os.path.join(log_dir, f"simple-env-{iter_}.mp4")
     import imageio
     imageio.mimsave(path_, frames, fps=20)
 
-    if not cfg.testing:
+    if wandb is not None and not cfg.testing:
         try:
             wandb.log({"example": wandb.Video(path_)})
         except Exception as e:
@@ -165,7 +169,7 @@ def eval_libero(model, device, cfg, iter_=0, log_dir="./",
         #               wandb, iter_, tokenizer=None, text_model=None):
     
     from libero.libero import benchmark
-    from libero.libero.envs import OffScreenRenderEnv
+    from libero.libero.envs import OffScreenRenderEnv, DenseRewardEnv
     import os
     from libero.libero.utils import get_libero_path
     from gymnasium.wrappers import FrameStack
@@ -271,7 +275,7 @@ def eval_libero(model, device, cfg, iter_=0, log_dir="./",
             
             env.reset()
             env.set_init_state(init_state)
-            env_ = FrameStackObservation(DictWrapper(env, obs_key="agentview_image"), cfg.policy.obs_stacking) ## Stacking the observations
+            env_ = FrameStack(DictWrapper(env, obs_key="agentview_image"), cfg.policy.obs_stacking)
             obs, info = env_.reset()
 
             mask = get_blocked_mask(cfg, targets=None, T=0) ## Get the blocked mask
@@ -283,7 +287,7 @@ def eval_libero(model, device, cfg, iter_=0, log_dir="./",
                 image_goal = goal_img
                 print(f"Using goal image from HDF5, shape: {image_goal.shape}")
             else:
-                image_goal = obs.reshape((256, 256, 3*cfg.policy.obs_stacking))[:,:,:3]
+                image_goal = np.array(obs)[0]
                 print("Using first observation as goal image")
             frames = []
             rewards = []
@@ -299,7 +303,7 @@ def eval_libero(model, device, cfg, iter_=0, log_dir="./",
                     t += 1
                     continue
                 # obs = obs.reshape((128, 128, 3*cfg.policy.obs_stacking)) ## Assuming the observation is an image of size 128x128 with 3 color channels  
-                obs = rearrange(obs, 't h w c -> h w (t c)', c=3, t=cfg.policy.obs_stacking) ## Rearranging the image to have the stacked history in the last channel dimension
+                obs = rearrange(np.array(obs), 't h w c -> h w (t c)', c=3, t=cfg.policy.obs_stacking)
                 # image = obs[:,:,:3] ## Remove the last dimension of the image color
                 obs_state = model.preprocess_state(obs)
                 goal_state = model.preprocess_goal_image(image_goal)
@@ -356,10 +360,12 @@ def eval_libero(model, device, cfg, iter_=0, log_dir="./",
     episode_stats = info.get('episode_stats', {})
     episode_stats['rewards'] = np.mean(rewards) 
     print(f"avg reward {np.mean(rewards):.8f}")
-    if not cfg.testing:
+    if wandb is not None and not cfg.testing:
         wandb.log({"avg reward_"+str(task_id): np.mean(rewards)})
-    if not cfg.testing:
-        wandb.log({"example": wandb.Video(path_)})
+        try:
+            wandb.log({"example": wandb.Video(path_)})
+        except Exception as e:
+            print(f"Warning: failed to log video to wandb: {e}")
     env.close()
     
     # Close HDF5 file if it was opened
@@ -395,7 +401,24 @@ def my_main(cfg: DictConfig):
         model_.set_dataset(dataset_buffer)
     else:
         from grp_model import GRP
+        from omegaconf import OmegaConf, open_dict
+
         model_ = torch.load(model_dir, pickle_module=dill)
+        # Pickled cfg may omit keys (struct / older runs); copy dataset stats from Hydra for eval.
+        if OmegaConf.select(model_._cfg, "dataset.action_mean", default=None) is None:
+            cam = OmegaConf.select(cfg, "dataset.action_mean", default=None)
+            cas = OmegaConf.select(cfg, "dataset.action_std", default=None)
+            if cam is not None and cas is not None:
+                with open_dict(model_._cfg.dataset):
+                    model_._cfg.dataset.action_mean = cam
+                    model_._cfg.dataset.action_std = cas
+        if OmegaConf.select(model_._cfg, "dataset.pose_mean", default=None) is None:
+            pm = OmegaConf.select(cfg, "dataset.pose_mean", default=None)
+            ps = OmegaConf.select(cfg, "dataset.pose_std", default=None)
+            if pm is not None and ps is not None:
+                with open_dict(model_._cfg.dataset):
+                    model_._cfg.dataset.pose_mean = pm
+                    model_._cfg.dataset.pose_std = ps
     # model_._cgf = cfg
 
     tokenizer = None
@@ -405,11 +428,20 @@ def my_main(cfg: DictConfig):
         tokenizer = T5Tokenizer.from_pretrained(cfg.dataset.t5_version)
         text_model = T5ForConditionalGeneration.from_pretrained(cfg.dataset.t5_version)
     
-    if "libero" in cfg.simEval:
+    sim_eval_modes = list(cfg.simEval) if cfg.simEval else []
+    if not sim_eval_modes:
+        print(
+            "Note: simEval is empty in conf (default 64pix-pose.yaml). "
+            "Defaulting to simple_env. Override with simEval='[simple_env]' or simEval='[libero]'."
+        )
+        sim_eval_modes = ["simple_env"]
+
+    results = None
+    if "libero" in sim_eval_modes:
         results = eval_libero(model_.to(cfg.device), device=cfg.device, cfg=cfg,
                           iter_=0, tokenizer=tokenizer, text_model=text_model, wandb=None,
                           log_dir=log_dir)
-    if "simple_env" in cfg.simEval:
+    if "simple_env" in sim_eval_modes:
         import simpler_env
         task_name = "widowx_carrot_on_plate"  # @param ["google_robot_pick_coke_can", "google_robot_move_near", "google_robot_open_drawer", "google_robot_close_drawer", "widowx_spoon_on_towel", "widowx_carrot_on_plate", "widowx_stack_cube", "widowx_put_eggplant_in_basket"]
         if 'env' in locals():
@@ -424,6 +456,7 @@ def my_main(cfg: DictConfig):
         print("results:", results)
 
     # cbuffer.save(cfg.dataset.to_name)
+    return results
 
 
 if __name__ == "__main__":

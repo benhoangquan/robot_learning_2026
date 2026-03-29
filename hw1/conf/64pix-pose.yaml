@@ -36,7 +36,7 @@ testing: false
 eval_vid_iters: 2500
 gradient_accumulation_steps: 1
 
-simEval: [] # "simpler_env" or "libero"
+simEval: ['libero'] # "simpler_env" or "libero"
 sim:
   eval_episodes: 1
   eval_tasks: [0]  # which tasks to eval on

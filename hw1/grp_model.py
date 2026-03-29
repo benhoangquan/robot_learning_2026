@@ -286,8 +286,12 @@ class GRP(nn.Module):
         # ------------------------------------------------------------------
         # 9) Classification token and action head
         # ------------------------------------------------------------------
-        cls_output = tokens[:, 0, :]           # [B, n_embd]
-        out = self.mlp_head(cls_output)     # [B, action_dim * action_stacking]
+        cls_output = tokens[:, 0, :]  # [B, n_embd]
+        # Older checkpoints use ``action_head``; current code registers ``mlp_head``.
+        head = getattr(self, "mlp_head", None) or getattr(self, "action_head", None)
+        if head is None:
+            raise AttributeError("GRP is missing action head (expected mlp_head or action_head)")
+        out = head(cls_output)  # [B, action_dim * action_stacking] (or *14 for discrete)
 
         # ------------------------------------------------------------------
         # 10) Loss (continuous actions by default, using MSE)
@@ -397,29 +401,82 @@ class GRP(nn.Module):
 
     def decode_action(self, action_tensor):
         """Decode normalized actions to original action space"""
+        from omegaconf import OmegaConf
         import torch as _torch
-        action_mean = _torch.tensor(np.repeat([self._cfg.dataset.action_mean], self._cfg.policy.action_stacking, axis=0).flatten(), 
-                                   dtype=action_tensor.dtype, device=action_tensor.device)
-        action_std = _torch.tensor(np.repeat([self._cfg.dataset.action_std], self._cfg.policy.action_stacking, axis=0).flatten(), 
-                                  dtype=action_tensor.dtype, device=action_tensor.device)
-        return (action_tensor * (action_std)) + action_mean
+
+        am = OmegaConf.select(self._cfg, "dataset.action_mean", default=None)
+        ast = OmegaConf.select(self._cfg, "dataset.action_std", default=None)
+        if am is None or ast is None:
+            return action_tensor
+        am = list(am)
+        ast = list(ast)
+        action_mean = _torch.tensor(
+            np.repeat([am], self._cfg.policy.action_stacking, axis=0).flatten(),
+            dtype=action_tensor.dtype,
+            device=action_tensor.device,
+        )
+        action_std = _torch.tensor(
+            np.repeat([ast], self._cfg.policy.action_stacking, axis=0).flatten(),
+            dtype=action_tensor.dtype,
+            device=action_tensor.device,
+        )
+        return (action_tensor * action_std) + action_mean
 
     def encode_action(self, action_float):
         """Encode actions to normalized space [-1, 1]"""
+        from omegaconf import OmegaConf
         import torch as _torch
-        ## If the action_float has length greater than action_dim then use stacking otherwise just use normal standardiaztion vectors
-        if action_float.shape[-1] == len(self._cfg.dataset.action_mean):
-            action_mean = _torch.tensor(self._cfg.dataset.action_mean, dtype=action_float.dtype, device=action_float.device)
-            action_std = _torch.tensor(self._cfg.dataset.action_std, dtype=action_float.dtype, device=action_float.device)
-            return (action_float - action_mean) / (action_std)  
 
-        stacking = action_float.shape[-1] // len(self._cfg.dataset.action_mean)
-        action_mean = _torch.tensor(np.repeat([self._cfg.dataset.action_mean], stacking, axis=0).flatten(), 
-                                   dtype=action_float.dtype, device=action_float.device)
-        action_std = _torch.tensor(np.repeat([self._cfg.dataset.action_std], stacking, axis=0).flatten(), 
-                                  dtype=action_float.dtype, device=action_float.device)
-        return (action_float - action_mean) / (action_std)
-    
+        am = OmegaConf.select(self._cfg, "dataset.action_mean", default=None)
+        ast = OmegaConf.select(self._cfg, "dataset.action_std", default=None)
+        if am is None or ast is None:
+            return action_float
+        am = list(am)
+        ast = list(ast)
+        d = len(am)
+        if action_float.shape[-1] == d:
+            action_mean = _torch.tensor(am, dtype=action_float.dtype, device=action_float.device)
+            action_std = _torch.tensor(ast, dtype=action_float.dtype, device=action_float.device)
+            return (action_float - action_mean) / action_std
+        stacking = action_float.shape[-1] // d
+        action_mean = _torch.tensor(
+            np.repeat([am], stacking, axis=0).flatten(),
+            dtype=action_float.dtype,
+            device=action_float.device,
+        )
+        action_std = _torch.tensor(
+            np.repeat([ast], stacking, axis=0).flatten(),
+            dtype=action_float.dtype,
+            device=action_float.device,
+        )
+        return (action_float - action_mean) / action_std
+
+    def encode_pose(self, pose_float):
+        """Normalize pose with ``dataset.pose_mean`` / ``dataset.pose_std`` when present; else pass through."""
+        from omegaconf import OmegaConf
+        import torch as _torch
+
+        pm = OmegaConf.select(self._cfg, "dataset.pose_mean", default=None)
+        ps = OmegaConf.select(self._cfg, "dataset.pose_std", default=None)
+        if pm is None or ps is None:
+            return pose_float
+        pose_mean = _torch.tensor(list(pm), dtype=pose_float.dtype, device=pose_float.device)
+        pose_std = _torch.tensor(list(ps), dtype=pose_float.dtype, device=pose_float.device)
+        return (pose_float - pose_mean) / pose_std
+
+    def decode_pose(self, pose_tensor):
+        """Invert :meth:`encode_pose` when pose stats exist."""
+        from omegaconf import OmegaConf
+        import torch as _torch
+
+        pm = OmegaConf.select(self._cfg, "dataset.pose_mean", default=None)
+        ps = OmegaConf.select(self._cfg, "dataset.pose_std", default=None)
+        if pm is None or ps is None:
+            return pose_tensor
+        pose_mean = _torch.tensor(list(pm), dtype=pose_tensor.dtype, device=pose_tensor.device)
+        pose_std = _torch.tensor(list(ps), dtype=pose_tensor.dtype, device=pose_tensor.device)
+        return pose_tensor * pose_std + pose_mean
+
     def decode_state(self, state_tensor):
         """
         Docstring for decode_state
@@ -428,11 +485,17 @@ class GRP(nn.Module):
         :param state_tensor: Description
         self._decode_state = lambda sinN: (sinN * state_std) + state_mean  # Undo mapping to [-1, 1]
         """
+        from omegaconf import OmegaConf
         import torch as _torch
-        state_mean = _torch.tensor(self._cfg.dataset.state_mean, dtype=state_tensor.dtype, device=state_tensor.device)
-        state_std = _torch.tensor(self._cfg.dataset.state_std, dtype=state_tensor.dtype, device=state_tensor.device)
-        return (state_tensor * (state_std)) + state_mean
-    
+
+        sm = OmegaConf.select(self._cfg, "dataset.state_mean", default=None)
+        ss = OmegaConf.select(self._cfg, "dataset.state_std", default=None)
+        if sm is None or ss is None:
+            return state_tensor
+        state_mean = _torch.tensor(list(sm), dtype=state_tensor.dtype, device=state_tensor.device)
+        state_std = _torch.tensor(list(ss), dtype=state_tensor.dtype, device=state_tensor.device)
+        return (state_tensor * state_std) + state_mean
+
     def encode_state(self, state_float):
         """
         Docstring for encode_state
@@ -441,17 +504,16 @@ class GRP(nn.Module):
         :param state_float: Description
         self._encode_state = lambda sf:   (sf - state_mean)/(state_std) # encoder: take a float, output an integer
         """
+        from omegaconf import OmegaConf
         import torch as _torch
-        state_mean = _torch.tensor(self._cfg.dataset.state_mean, dtype=state_float.dtype, device=state_float.device)
-        state_std = _torch.tensor(self._cfg.dataset.state_std, dtype=state_float.dtype, device=state_float.device)
-        return (state_float - state_mean) / (state_std)
 
-    def encode_pose(self, pose_float):
-        """Encode robot pose to normalized space"""
-        import torch as _torch
-        pose_mean = _torch.tensor(self._cfg.dataset.pose_mean, dtype=pose_float.dtype, device=pose_float.device)
-        pose_std = _torch.tensor(self._cfg.dataset.pose_std, dtype=pose_float.dtype, device=pose_float.device)
-        return (pose_float - pose_mean) / (pose_std)
+        sm = OmegaConf.select(self._cfg, "dataset.state_mean", default=None)
+        ss = OmegaConf.select(self._cfg, "dataset.state_std", default=None)
+        if sm is None or ss is None:
+            return state_float
+        state_mean = _torch.tensor(list(sm), dtype=state_float.dtype, device=state_float.device)
+        state_std = _torch.tensor(list(ss), dtype=state_float.dtype, device=state_float.device)
+        return (state_float - state_mean) / state_std
 
 
 @torch.no_grad()
