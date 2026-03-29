@@ -173,7 +173,7 @@ def eval_libero(model, device, cfg, iter_=0, log_dir="./",
     from libero.libero.envs import OffScreenRenderEnv, DenseRewardEnv
     import os
     from libero.libero.utils import get_libero_path
-    from gymnasium.wrappers import FrameStack as FrameStackObservation # For gymnasium 0.26.4
+    from gymnasium.wrappers import FrameStack
     from einops import rearrange
     import cv2
 
@@ -248,7 +248,7 @@ def eval_libero(model, device, cfg, iter_=0, log_dir="./",
             
             env.reset()
             env.set_init_state(init_state)
-            env_ = FrameStackObservation(DictWrapper(env, obs_key="agentview_image"), cfg.policy.obs_stacking) ## Stacking the observations
+            env_ = FrameStack(DictWrapper(env, obs_key="agentview_image"), cfg.policy.obs_stacking)
             obs, info = env_.reset()
 
             mask = get_blocked_mask(cfg, targets=None, T=0) ## Get the blocked mask

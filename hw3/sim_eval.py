@@ -194,7 +194,7 @@ def eval_libero(model, device, cfg, iter_=0, log_dir="./",
     from libero.libero.envs import OffScreenRenderEnv, DenseRewardEnv
     import os
     from libero.libero.utils import get_libero_path
-    from gymnasium.wrappers import FrameStackObservation
+    from gymnasium.wrappers import FrameStack
     from einops import rearrange
     import cv2
 
@@ -290,7 +290,7 @@ def eval_libero(model, device, cfg, iter_=0, log_dir="./",
 
             env.reset()
             env.set_init_state(init_state)
-            env_ = FrameStackObservation(DictWrapper(env, obs_key="agentview_image"), cfg.policy.obs_stacking) ## Stacking the observations
+            env_ = FrameStack(DictWrapper(env, obs_key="agentview_image"), cfg.policy.obs_stacking)
             obs, info = env_.reset()
 
             mask = get_blocked_mask(cfg, targets=None, T=0) ## Get the blocked mask
@@ -302,7 +302,7 @@ def eval_libero(model, device, cfg, iter_=0, log_dir="./",
                 image_goal = goal_img
                 print(f"Using goal image from HDF5, shape: {image_goal.shape}")
             else:
-                image_goal = np.zeros((256, 256, 3*cfg.policy.obs_stacking))[:,:,:3]
+                image_goal = np.array(obs)[0]
                 print("Using first observation as goal image")
             frames = []
             rewards = []
@@ -321,7 +321,7 @@ def eval_libero(model, device, cfg, iter_=0, log_dir="./",
                     t += 1
                     continue
                 # obs = obs.reshape((128, 128, 3*cfg.policy.obs_stacking)) ## Assuming the observation is an image of size 128x128 with 3 color channels  
-                obs = rearrange(obs, 't h w c -> h w (t c)', c=3, t=cfg.policy.obs_stacking) ## Rearranging the image to have the stacked history in the last channel dimension
+                obs = rearrange(np.array(obs), 't h w c -> h w (t c)', c=3, t=cfg.policy.obs_stacking)
                 # image = obs[:,:,:3] ## Remove the last dimension of the image color
                 obs_state = model.preprocess_state(obs)
                 goal_state = model.preprocess_goal_image(image_goal)
